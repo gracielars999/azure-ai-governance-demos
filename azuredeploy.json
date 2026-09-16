@@ -1,0 +1,944 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.41.2.15936",
+      "templateHash": "4565337572503970055"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Región de Azure para todos los recursos."
+      }
+    },
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "aigov",
+      "minLength": 2,
+      "maxLength": 10,
+      "metadata": {
+        "description": "Prefijo corto para nombrar los recursos."
+      }
+    },
+    "resourceSuffix": {
+      "type": "string",
+      "defaultValue": "[substring(uniqueString(resourceGroup().id), 0, 5)]",
+      "metadata": {
+        "description": "Sufijo único (por defecto derivado del grupo de recursos)."
+      }
+    },
+    "apimPublisherEmail": {
+      "type": "string",
+      "defaultValue": "admin@contoso.com",
+      "metadata": {
+        "description": "Email del publicador de API Management (requerido por APIM)."
+      }
+    },
+    "apimPublisherName": {
+      "type": "string",
+      "defaultValue": "Contoso AI Platform",
+      "metadata": {
+        "description": "Nombre del publicador de API Management."
+      }
+    },
+    "chatDeploymentName": {
+      "type": "string",
+      "defaultValue": "gpt-4o",
+      "metadata": {
+        "description": "Nombre del despliegue del modelo de chat."
+      }
+    },
+    "chatModelVersion": {
+      "type": "string",
+      "defaultValue": "2024-11-20",
+      "metadata": {
+        "description": "Versión del modelo gpt-4o."
+      }
+    },
+    "chatCapacity": {
+      "type": "int",
+      "defaultValue": 20,
+      "metadata": {
+        "description": "Capacidad (miles de TPM) del modelo de chat."
+      }
+    },
+    "embeddingDeploymentName": {
+      "type": "string",
+      "defaultValue": "text-embedding-3-small",
+      "metadata": {
+        "description": "Nombre del despliegue del modelo de embeddings (caché semántica)."
+      }
+    },
+    "embeddingCapacity": {
+      "type": "int",
+      "defaultValue": 50,
+      "metadata": {
+        "description": "Capacidad (miles de TPM) del modelo de embeddings."
+      }
+    },
+    "deploySemanticCache": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Desplegar Azure Managed Redis para la caché semántica (tiene costo mientras esté activo)."
+      }
+    },
+    "bancaImage": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/k8se/quickstart:latest",
+      "metadata": {
+        "description": "Imagen de contenedor para la app de Banca. Por defecto un placeholder público que se reemplaza al construir la imagen real."
+      }
+    },
+    "saludImage": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/k8se/quickstart:latest",
+      "metadata": {
+        "description": "Imagen de contenedor para la app de Salud."
+      }
+    },
+    "buildAppImages": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Construir automáticamente las imágenes de las apps desde el repo público y actualizarlas (botón one-click)."
+      }
+    },
+    "repoGitUrl": {
+      "type": "string",
+      "defaultValue": "https://github.com/gracielars999/azure-ai-governance-demos.git",
+      "metadata": {
+        "description": "URL .git del repositorio público con el código de las apps (para az acr build)."
+      }
+    },
+    "repoBranch": {
+      "type": "string",
+      "defaultValue": "main",
+      "metadata": {
+        "description": "Rama del repositorio para construir las imágenes."
+      }
+    },
+    "deploymentTimestamp": {
+      "type": "string",
+      "defaultValue": "[utcNow()]",
+      "metadata": {
+        "description": "Marca de tiempo para forzar la re-ejecución del script de construcción (no modificar)."
+      }
+    }
+  },
+  "variables": {
+    "$fxv#0": "<policies>\r\n    <inbound>\r\n        <!-- 0. CACHÉ SEMÁNTICA (lookup) DEL AI GATEWAY:\r\n             Genera un embedding del último mensaje (text-embedding-3-small) y busca en\r\n             Azure Managed Redis una pregunta SIMILAR EN SIGNIFICADO (no solo idéntica).\r\n             En un HIT se sirve la respuesta cacheada: 0 tokens al modelo, 0 costo,\r\n             respuesta en milisegundos -> AHORRO.\r\n             vary-by por suscripción => caché AISLADA por unidad de negocio (banca). -->\r\n        <llm-semantic-cache-lookup score-threshold=\"0.2\" embeddings-backend-id=\"embeddings-backend\" embeddings-backend-auth=\"system-assigned\" ignore-system-messages=\"true\" max-message-count=\"10\">\r\n            <vary-by>@(context.Subscription != null ? context.Subscription.Id : \"anon\")</vary-by>\r\n        </llm-semantic-cache-lookup>\r\n\r\n        <base />\r\n        <!-- 1. SEGURIDAD: autenticación a Foundry/AOAI con Managed Identity (sin llaves) -->\r\n        <authentication-managed-identity resource=\"https://cognitiveservices.azure.com\" output-token-variable-name=\"msi-token\" ignore-error=\"false\" />\r\n        <set-header name=\"Authorization\" exists-action=\"override\">\r\n            <value>@(\"Bearer \" + (string)context.Variables[\"msi-token\"])</value>\r\n        </set-header>\r\n\r\n        <!-- 2. GOBERNANZA / FINOPS: el límite de tokens por minuto se define por\r\n             UNIDAD DE NEGOCIO a nivel de PRODUCT (Banca-Retail vs Banca-Empresas),\r\n             y se inyecta aquí mediante <base />. Así cada BU tiene su propia cuota. -->\r\n\r\n        <!-- 3. Enrutamiento al backend de Foundry (Azure OpenAI) -->\r\n        <set-backend-service backend-id=\"aoai-backend\" />\r\n\r\n        <!-- 4. FINOPS / OBSERVABILIDAD: métricas de tokens por consumidor a Application Insights -->\r\n        <azure-openai-emit-token-metric namespace=\"banca-ai-gateway\">\r\n            <dimension name=\"UnidadNegocio\" value=\"@(context.Subscription.Name ?? context.Subscription.Id)\" />\r\n            <dimension name=\"API\" value=\"@(context.Api.Name)\" />\r\n            <dimension name=\"Operacion\" value=\"@(context.Operation.Name)\" />\r\n        </azure-openai-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <forward-request timeout=\"120\" />\r\n    </backend>\r\n    <outbound>\r\n        <!-- ===== Región SOLO-MISS: se OMITE por completo en un HIT semántico.\r\n             En un HIT, la ejecución se reanuda justo DESPUÉS de <llm-semantic-cache-store>,\r\n             por lo que todo lo de arriba (incluido el conteo de tokens del token-limit vía base)\r\n             no corre en un HIT -> los HIT no consumen cuota ni tokens del modelo. ===== -->\r\n        <base />\r\n        <set-variable name=\"cacheMiss\" value=\"1\" />\r\n        <!-- Almacena la respuesta + su embedding en Azure Managed Redis para preguntas SIMILARES futuras -->\r\n        <llm-semantic-cache-store duration=\"3600\" />\r\n\r\n        <!-- ===== Región COMÚN: corre en HIT y en MISS ===== -->\r\n        <!-- Parsear el consumo de tokens (en un HIT provienen de la respuesta cacheada) -->\r\n        <set-variable name=\"promptTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"prompt_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"completionTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"completion_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"totalTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"total_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <choose>\r\n            <when condition=\"@(context.Variables.ContainsKey(\"cacheMiss\"))\">\r\n                <!-- MISS: la respuesta vino del modelo (Foundry) y se acaba de almacenar -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>MISS</value>\r\n                </set-header>\r\n                <trace source=\"banca-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Banca\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"MISS\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </when>\r\n            <otherwise>\r\n                <!-- HIT SEMÁNTICO: respuesta servida desde Azure Managed Redis por SIMILITUD de significado.\r\n                     0 tokens al modelo, 0 costo, respuesta en milisegundos -> AHORRO. -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>HIT</value>\r\n                </set-header>\r\n                <trace source=\"banca-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Banca\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"HIT\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </otherwise>\r\n        </choose>\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n        <choose>\r\n            <when condition=\"@(context.LastError.Source == \"azure-openai-token-limit\")\">\r\n                <return-response>\r\n                    <set-status code=\"429\" reason=\"Token Limit Exceeded\" />\r\n                    <set-header name=\"Retry-After\" exists-action=\"override\">\r\n                        <value>60</value>\r\n                    </set-header>\r\n                    <set-body>{\"error\": \"Se alcanzó el límite de tokens por minuto (gobernanza de costos del AI Gateway). Intenta de nuevo en un momento.\"}</set-body>\r\n                </return-response>\r\n            </when>\r\n        </choose>\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#1": "<policies>\r\n    <inbound>\r\n        <!-- 0. CACHÉ SEMÁNTICA (lookup) DEL AI GATEWAY:\r\n             Genera un embedding del último mensaje (text-embedding-3-small) y busca en\r\n             Azure Managed Redis una pregunta SIMILAR EN SIGNIFICADO (no solo idéntica).\r\n             En un HIT se sirve la respuesta cacheada: 0 tokens al modelo, 0 costo,\r\n             respuesta en milisegundos -> AHORRO.\r\n             vary-by por suscripción => caché AISLADA por división / línea. -->\r\n        <llm-semantic-cache-lookup score-threshold=\"0.2\" embeddings-backend-id=\"embeddings-backend\" embeddings-backend-auth=\"system-assigned\" ignore-system-messages=\"true\" max-message-count=\"10\">\r\n            <vary-by>@(context.Subscription != null ? context.Subscription.Id : \"anon\")</vary-by>\r\n        </llm-semantic-cache-lookup>\r\n\r\n        <base />\r\n        <!-- 1. SEGURIDAD: autenticación a Foundry/AOAI con Managed Identity (sin llaves) -->\r\n        <authentication-managed-identity resource=\"https://cognitiveservices.azure.com\" output-token-variable-name=\"msi-token\" ignore-error=\"false\" />\r\n        <set-header name=\"Authorization\" exists-action=\"override\">\r\n            <value>@(\"Bearer \" + (string)context.Variables[\"msi-token\"])</value>\r\n        </set-header>\r\n\r\n        <!-- 2. GOBERNANZA / FINOPS: el límite de tokens por minuto se define por\r\n             DIVISIÓN / LÍNEA a nivel de PRODUCT (Salud-Primaria vs Salud-Especialidad),\r\n             y se inyecta aquí mediante <base />. Así cada división tiene su propia cuota. -->\r\n\r\n        <!-- 3. Enrutamiento al backend de Foundry (Azure OpenAI) -->\r\n        <set-backend-service backend-id=\"aoai-backend\" />\r\n\r\n        <!-- 4. FINOPS / OBSERVABILIDAD: métricas de tokens por consumidor a Application Insights -->\r\n        <azure-openai-emit-token-metric namespace=\"salud-ai-gateway\">\r\n            <dimension name=\"UnidadNegocio\" value=\"@(context.Subscription.Name ?? context.Subscription.Id)\" />\r\n            <dimension name=\"API\" value=\"@(context.Api.Name)\" />\r\n            <dimension name=\"Operacion\" value=\"@(context.Operation.Name)\" />\r\n        </azure-openai-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <forward-request timeout=\"120\" />\r\n    </backend>\r\n    <outbound>\r\n        <!-- ===== Región SOLO-MISS: se OMITE por completo en un HIT semántico.\r\n             En un HIT, la ejecución se reanuda justo DESPUÉS de <llm-semantic-cache-store>,\r\n             por lo que todo lo de arriba (incluido el conteo de tokens del token-limit vía base)\r\n             no corre en un HIT -> los HIT no consumen cuota ni tokens del modelo. ===== -->\r\n        <base />\r\n        <set-variable name=\"cacheMiss\" value=\"1\" />\r\n        <!-- Almacena la respuesta + su embedding en Azure Managed Redis para preguntas SIMILARES futuras -->\r\n        <llm-semantic-cache-store duration=\"3600\" />\r\n\r\n        <!-- ===== Región COMÚN: corre en HIT y en MISS ===== -->\r\n        <!-- Parsear el consumo de tokens (en un HIT provienen de la respuesta cacheada) -->\r\n        <set-variable name=\"promptTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"prompt_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"completionTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"completion_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"totalTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"total_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <choose>\r\n            <when condition=\"@(context.Variables.ContainsKey(\"cacheMiss\"))\">\r\n                <!-- MISS: la respuesta vino del modelo (Foundry) y se acaba de almacenar -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>MISS</value>\r\n                </set-header>\r\n                <trace source=\"salud-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Salud\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"MISS\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </when>\r\n            <otherwise>\r\n                <!-- HIT SEMÁNTICO: respuesta servida desde Azure Managed Redis por SIMILITUD de significado.\r\n                     0 tokens al modelo, 0 costo, respuesta en milisegundos -> AHORRO. -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>HIT</value>\r\n                </set-header>\r\n                <trace source=\"salud-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Salud\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"HIT\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </otherwise>\r\n        </choose>\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n        <choose>\r\n            <when condition=\"@(context.LastError.Source == \"azure-openai-token-limit\")\">\r\n                <return-response>\r\n                    <set-status code=\"429\" reason=\"Token Limit Exceeded\" />\r\n                    <set-header name=\"Retry-After\" exists-action=\"override\">\r\n                        <value>60</value>\r\n                    </set-header>\r\n                    <set-body>{\"error\": \"Se alcanzó el límite de tokens por minuto (gobernanza de costos del AI Gateway). Intenta de nuevo en un momento.\"}</set-body>\r\n                </return-response>\r\n            </when>\r\n        </choose>\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#2": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Banca Retail = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Banca-Retail</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#3": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Banca Empresas = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Banca-Empresas</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#4": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR DIVISIÓN: Atención Primaria = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Salud-Primaria</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#5": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR DIVISIÓN: Especialidad = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Salud-Especialidad</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "suffix": "[toLower(parameters('resourceSuffix'))]",
+    "lawName": "[format('{0}-law-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "appInsightsName": "[format('{0}-appi-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "acrName": "[toLower(format('{0}acr{1}', parameters('namePrefix'), variables('suffix')))]",
+    "aiName": "[format('{0}-aif-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "redisName": "[format('{0}-amr-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "apimName": "[format('{0}-apim-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "acaEnvName": "[format('{0}-cae-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "bancaAppName": "ca-banca-web",
+    "saludAppName": "ca-salud-web",
+    "uamiName": "[format('{0}-deploy-{1}', parameters('namePrefix'), variables('suffix'))]",
+    "cognitiveServicesUserRoleId": "a97b65f3-24c7-4388-baec-2e87135dc908",
+    "acrPullRoleId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+    "contributorRoleId": "b24988ac-6180-42a0-ab88-20f7382dd24c",
+    "products": [
+      {
+        "id": "banca-retail",
+        "display": "Banca Retail",
+        "api": "banca",
+        "policy": "[variables('$fxv#2')]"
+      },
+      {
+        "id": "banca-empresas",
+        "display": "Banca Empresas",
+        "api": "banca",
+        "policy": "[variables('$fxv#3')]"
+      },
+      {
+        "id": "salud-primaria",
+        "display": "Salud Atención Primaria",
+        "api": "salud",
+        "policy": "[variables('$fxv#4')]"
+      },
+      {
+        "id": "salud-especialidad",
+        "display": "Salud Especialidad",
+        "api": "salud",
+        "policy": "[variables('$fxv#5')]"
+      }
+    ],
+    "gatewayUrl": "[format('https://{0}.azure-api.net', variables('apimName'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('lawName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.Insights/components",
+      "apiVersion": "2020-02-02",
+      "name": "[variables('appInsightsName')]",
+      "location": "[parameters('location')]",
+      "kind": "web",
+      "properties": {
+        "Application_Type": "web",
+        "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName'))]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2023-07-01",
+      "name": "[variables('acrName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Basic"
+      },
+      "properties": {
+        "adminUserEnabled": false
+      }
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts",
+      "apiVersion": "2024-10-01",
+      "name": "[variables('aiName')]",
+      "location": "[parameters('location')]",
+      "kind": "AIServices",
+      "sku": {
+        "name": "S0"
+      },
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "customSubDomainName": "[variables('aiName')]",
+        "publicNetworkAccess": "Enabled",
+        "disableLocalAuth": false
+      }
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts/deployments",
+      "apiVersion": "2024-10-01",
+      "name": "[format('{0}/{1}', variables('aiName'), parameters('chatDeploymentName'))]",
+      "sku": {
+        "name": "GlobalStandard",
+        "capacity": "[parameters('chatCapacity')]"
+      },
+      "properties": {
+        "model": {
+          "format": "OpenAI",
+          "name": "gpt-4o",
+          "version": "[parameters('chatModelVersion')]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.CognitiveServices/accounts/deployments",
+      "apiVersion": "2024-10-01",
+      "name": "[format('{0}/{1}', variables('aiName'), parameters('embeddingDeploymentName'))]",
+      "sku": {
+        "name": "Standard",
+        "capacity": "[parameters('embeddingCapacity')]"
+      },
+      "properties": {
+        "model": {
+          "format": "OpenAI",
+          "name": "text-embedding-3-small",
+          "version": "1"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+        "[resourceId('Microsoft.CognitiveServices/accounts/deployments', variables('aiName'), parameters('chatDeploymentName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('deploySemanticCache')]",
+      "type": "Microsoft.Cache/redisEnterprise",
+      "apiVersion": "2024-10-01",
+      "name": "[variables('redisName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Balanced_B0"
+      }
+    },
+    {
+      "condition": "[parameters('deploySemanticCache')]",
+      "type": "Microsoft.Cache/redisEnterprise/databases",
+      "apiVersion": "2024-10-01",
+      "name": "[format('{0}/{1}', variables('redisName'), 'default')]",
+      "properties": {
+        "clientProtocol": "Encrypted",
+        "port": 10000,
+        "clusteringPolicy": "EnterpriseCluster",
+        "evictionPolicy": "NoEviction",
+        "modules": [
+          {
+            "name": "RediSearch"
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Cache/redisEnterprise', variables('redisName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('apimName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Developer",
+        "capacity": 1
+      },
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "publisherEmail": "[parameters('apimPublisherEmail')]",
+        "publisherName": "[parameters('apimPublisherName')]"
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+      "name": "[guid(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), resourceId('Microsoft.ApiManagement/service', variables('apimName')), variables('cognitiveServicesUserRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('cognitiveServicesUserRoleId'))]",
+        "principalId": "[reference(resourceId('Microsoft.ApiManagement/service', variables('apimName')), '2024-05-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/loggers",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), 'appinsights-logger')]",
+      "properties": {
+        "loggerType": "applicationInsights",
+        "resourceId": "[resourceId('Microsoft.Insights/components', variables('appInsightsName'))]",
+        "credentials": {
+          "instrumentationKey": "[reference(resourceId('Microsoft.Insights/components', variables('appInsightsName')), '2020-02-02').InstrumentationKey]"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]",
+        "[resourceId('Microsoft.Insights/components', variables('appInsightsName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/diagnostics",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), 'applicationinsights')]",
+      "properties": {
+        "loggerId": "[resourceId('Microsoft.ApiManagement/service/loggers', variables('apimName'), 'appinsights-logger')]",
+        "alwaysLog": "allErrors",
+        "sampling": {
+          "samplingType": "fixed",
+          "percentage": 100
+        },
+        "verbosity": "information",
+        "httpCorrelationProtocol": "W3C"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]",
+        "[resourceId('Microsoft.ApiManagement/service/loggers', variables('apimName'), 'appinsights-logger')]"
+      ]
+    },
+    {
+      "condition": "[parameters('deploySemanticCache')]",
+      "type": "Microsoft.ApiManagement/service/caches",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), parameters('location'))]",
+      "properties": {
+        "connectionString": "[format('{0}:10000,password={1},ssl=True,abortConnect=False', reference(resourceId('Microsoft.Cache/redisEnterprise', variables('redisName')), '2024-10-01').hostName, listKeys(resourceId('Microsoft.Cache/redisEnterprise/databases', variables('redisName'), 'default'), '2024-10-01').primaryKey)]",
+        "useFromLocation": "[parameters('location')]",
+        "description": "Azure Managed Redis - caché semántica del AI Gateway"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]",
+        "[resourceId('Microsoft.Cache/redisEnterprise', variables('redisName'))]",
+        "[resourceId('Microsoft.Cache/redisEnterprise/databases', variables('redisName'), 'default')]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/backends",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), 'aoai-backend')]",
+      "properties": {
+        "protocol": "http",
+        "url": "[format('{0}openai', reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), '2024-10-01').endpoint)]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/backends",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), 'embeddings-backend')]",
+      "properties": {
+        "protocol": "http",
+        "url": "[format('{0}openai/deployments/{1}/embeddings', reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), '2024-10-01').endpoint, parameters('embeddingDeploymentName'))]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), 'banca')]",
+      "properties": {
+        "displayName": "Banca AI Gateway",
+        "path": "banca",
+        "protocols": [
+          "https"
+        ],
+        "subscriptionRequired": true,
+        "serviceUrl": "[format('{0}openai', reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), '2024-10-01').endpoint)]",
+        "subscriptionKeyParameterNames": {
+          "header": "Ocp-Apim-Subscription-Key",
+          "query": "subscription-key"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis/operations",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/{2}', variables('apimName'), 'banca', 'chat-completions')]",
+      "properties": {
+        "displayName": "Chat Completions",
+        "method": "POST",
+        "urlTemplate": "/deployments/{deployment-id}/chat/completions",
+        "templateParameters": [
+          {
+            "name": "deployment-id",
+            "required": true,
+            "type": "string"
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'banca')]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis/policies",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/{2}', variables('apimName'), 'banca', 'policy')]",
+      "properties": {
+        "format": "rawxml",
+        "value": "[variables('$fxv#0')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'banca')]",
+        "[resourceId('Microsoft.ApiManagement/service/caches', variables('apimName'), parameters('location'))]",
+        "[resourceId('Microsoft.ApiManagement/service/backends', variables('apimName'), 'aoai-backend')]",
+        "[resourceId('Microsoft.ApiManagement/service/backends', variables('apimName'), 'embeddings-backend')]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), 'salud')]",
+      "properties": {
+        "displayName": "Salud AI Gateway",
+        "path": "salud",
+        "protocols": [
+          "https"
+        ],
+        "subscriptionRequired": true,
+        "serviceUrl": "[format('{0}openai', reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), '2024-10-01').endpoint)]",
+        "subscriptionKeyParameterNames": {
+          "header": "Ocp-Apim-Subscription-Key",
+          "query": "subscription-key"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis/operations",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/{2}', variables('apimName'), 'salud', 'chat-completions')]",
+      "properties": {
+        "displayName": "Chat Completions",
+        "method": "POST",
+        "urlTemplate": "/deployments/{deployment-id}/chat/completions",
+        "templateParameters": [
+          {
+            "name": "deployment-id",
+            "required": true,
+            "type": "string"
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'salud')]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis/policies",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/{2}', variables('apimName'), 'salud', 'policy')]",
+      "properties": {
+        "format": "rawxml",
+        "value": "[variables('$fxv#1')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/caches', variables('apimName'), parameters('location'))]",
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'salud')]",
+        "[resourceId('Microsoft.ApiManagement/service/backends', variables('apimName'), 'aoai-backend')]",
+        "[resourceId('Microsoft.ApiManagement/service/backends', variables('apimName'), 'embeddings-backend')]"
+      ]
+    },
+    {
+      "copy": {
+        "name": "apimProducts",
+        "count": "[length(variables('products'))]"
+      },
+      "type": "Microsoft.ApiManagement/service/products",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), variables('products')[copyIndex()].id)]",
+      "properties": {
+        "displayName": "[variables('products')[copyIndex()].display]",
+        "description": "[format('Producto de gobernanza para {0}', variables('products')[copyIndex()].display)]",
+        "subscriptionRequired": true,
+        "approvalRequired": false,
+        "state": "published"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]"
+      ]
+    },
+    {
+      "copy": {
+        "name": "apimProductApis",
+        "count": "[length(variables('products'))]"
+      },
+      "type": "Microsoft.ApiManagement/service/products/apis",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/{2}', variables('apimName'), variables('products')[copyIndex()].id, variables('products')[copyIndex()].api)]",
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'banca')]",
+        "[resourceId('Microsoft.ApiManagement/service/products', variables('apimName'), variables('products')[copyIndex()].id)]",
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'salud')]"
+      ]
+    },
+    {
+      "copy": {
+        "name": "apimProductPolicies",
+        "count": "[length(variables('products'))]"
+      },
+      "type": "Microsoft.ApiManagement/service/products/policies",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/policy', variables('apimName'), variables('products')[copyIndex()].id)]",
+      "properties": {
+        "format": "rawxml",
+        "value": "[variables('products')[copyIndex()].policy]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/products', variables('apimName'), variables('products')[copyIndex()].id)]"
+      ]
+    },
+    {
+      "copy": {
+        "name": "apimSubscriptions",
+        "count": "[length(variables('products'))]"
+      },
+      "type": "Microsoft.ApiManagement/service/subscriptions",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), variables('products')[copyIndex()].id)]",
+      "properties": {
+        "displayName": "[variables('products')[copyIndex()].display]",
+        "scope": "[format('{0}/products/{1}', resourceId('Microsoft.ApiManagement/service', variables('apimName')), variables('products')[copyIndex()].id)]",
+        "state": "active"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]",
+        "[resourceId('Microsoft.ApiManagement/service/products', variables('apimName'), variables('products')[copyIndex()].id)]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('acaEnvName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName')), '2023-09-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName')), '2023-09-01').primarySharedKey]"
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('bancaAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "tags": {
+        "azd-service-name": "banca"
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 8000,
+            "transport": "auto"
+          },
+          "registries": [
+            {
+              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]",
+              "identity": "system"
+            }
+          ],
+          "secrets": [
+            {
+              "name": "subkey-retail",
+              "value": "[listSecrets(resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[1]), '2024-05-01').primaryKey]"
+            },
+            {
+              "name": "subkey-empresas",
+              "value": "[listSecrets(resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[1]), '2024-05-01').primaryKey]"
+            }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "[parameters('bancaImage')]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "APIM_GATEWAY_URL",
+                  "value": "[variables('gatewayUrl')]"
+                },
+                {
+                  "name": "APIM_API_PATH",
+                  "value": "banca"
+                },
+                {
+                  "name": "MODEL_DEPLOYMENT",
+                  "value": "[parameters('chatDeploymentName')]"
+                },
+                {
+                  "name": "SUBKEY_RETAIL",
+                  "secretRef": "subkey-retail"
+                },
+                {
+                  "name": "SUBKEY_EMPRESAS",
+                  "secretRef": "subkey-empresas"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 2
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[1])]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[1])]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('saludAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "tags": {
+        "azd-service-name": "salud"
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 8000,
+            "transport": "auto"
+          },
+          "registries": [
+            {
+              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]",
+              "identity": "system"
+            }
+          ],
+          "secrets": [
+            {
+              "name": "subkey-primaria",
+              "value": "[listSecrets(resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[2].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[2].id), '/')[1]), '2024-05-01').primaryKey]"
+            },
+            {
+              "name": "subkey-especialidad",
+              "value": "[listSecrets(resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[3].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[3].id), '/')[1]), '2024-05-01').primaryKey]"
+            }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "[parameters('saludImage')]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "APIM_GATEWAY_URL",
+                  "value": "[variables('gatewayUrl')]"
+                },
+                {
+                  "name": "APIM_API_PATH",
+                  "value": "salud"
+                },
+                {
+                  "name": "MODEL_DEPLOYMENT",
+                  "value": "[parameters('chatDeploymentName')]"
+                },
+                {
+                  "name": "SEND_HISTORY",
+                  "value": "0"
+                },
+                {
+                  "name": "SUBKEY_PRIMARIA",
+                  "secretRef": "subkey-primaria"
+                },
+                {
+                  "name": "SUBKEY_ESPECIALIDAD",
+                  "secretRef": "subkey-especialidad"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 2
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[2].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[2].id), '/')[1])]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[3].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[3].id), '/')[1])]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('bancaAppName')), variables('acrPullRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('bancaAppName')), '2024-03-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.App/containerApps', variables('bancaAppName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('saludAppName')), variables('acrPullRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('saludAppName')), '2024-03-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.App/containerApps', variables('saludAppName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('buildAppImages')]",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[variables('uamiName')]",
+      "location": "[parameters('location')]"
+    },
+    {
+      "condition": "[parameters('buildAppImages')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('uamiName'), variables('contributorRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('contributorRoleId'))]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName')), '2023-01-31').principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('buildAppImages')]",
+      "type": "Microsoft.Resources/deploymentScripts",
+      "apiVersion": "2023-08-01",
+      "name": "[format('{0}-build-{1}', parameters('namePrefix'), variables('suffix'))]",
+      "location": "[parameters('location')]",
+      "kind": "AzureCLI",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName')))]": {}
+        }
+      },
+      "properties": {
+        "azCliVersion": "2.61.0",
+        "timeout": "PT45M",
+        "retentionInterval": "PT1H",
+        "cleanupPreference": "OnSuccess",
+        "forceUpdateTag": "[parameters('deploymentTimestamp')]",
+        "environmentVariables": [
+          {
+            "name": "ACR",
+            "value": "[variables('acrName')]"
+          },
+          {
+            "name": "ACR_SERVER",
+            "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]"
+          },
+          {
+            "name": "RG",
+            "value": "[resourceGroup().name]"
+          },
+          {
+            "name": "REPO",
+            "value": "[parameters('repoGitUrl')]"
+          },
+          {
+            "name": "BRANCH",
+            "value": "[parameters('repoBranch')]"
+          },
+          {
+            "name": "BANCA_APP",
+            "value": "[variables('bancaAppName')]"
+          },
+          {
+            "name": "SALUD_APP",
+            "value": "[variables('saludAppName')]"
+          }
+        ],
+        "scriptContent": "      set -e\r\n      echo \"Construyendo imagen de Banca...\"\r\n      az acr build --registry \"$ACR\" --image banca-web:latest \"${REPO}#${BRANCH}:banca-ai-demo\"\r\n      echo \"Construyendo imagen de Salud...\"\r\n      az acr build --registry \"$ACR\" --image salud-web:latest \"${REPO}#${BRANCH}:salud-ai-demo\"\r\n      echo \"Actualizando Container Apps con las imágenes reales...\"\r\n      az containerapp update -g \"$RG\" -n \"$BANCA_APP\" --image \"${ACR_SERVER}/banca-web:latest\"\r\n      az containerapp update -g \"$RG\" -n \"$SALUD_APP\" --image \"${ACR_SERVER}/salud-web:latest\"\r\n      echo \"Listo.\"\r\n    "
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('bancaAppName')), variables('acrPullRoleId')))]",
+        "[resourceId('Microsoft.App/containerApps', variables('bancaAppName'))]",
+        "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('saludAppName')), variables('acrPullRoleId')))]",
+        "[resourceId('Microsoft.App/containerApps', variables('saludAppName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]",
+        "[resourceId('Microsoft.Authorization/roleAssignments', guid(resourceGroup().id, variables('uamiName'), variables('contributorRoleId')))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "aiGatewayUrl": {
+      "type": "string",
+      "value": "[variables('gatewayUrl')]"
+    },
+    "apimName": {
+      "type": "string",
+      "value": "[variables('apimName')]"
+    },
+    "appInsightsName": {
+      "type": "string",
+      "value": "[variables('appInsightsName')]"
+    },
+    "acrLoginServer": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]"
+    },
+    "AZURE_CONTAINER_REGISTRY_ENDPOINT": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]"
+    },
+    "AZURE_CONTAINER_REGISTRY_NAME": {
+      "type": "string",
+      "value": "[variables('acrName')]"
+    },
+    "bancaAppUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('bancaAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
+    "saludAppUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('saludAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
+    "foundryEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), '2024-10-01').endpoint]"
+    },
+    "resourceGroupName": {
+      "type": "string",
+      "value": "[resourceGroup().name]"
+    },
+    "howToGetKeys": {
+      "type": "string",
+      "value": "[format('az apim subscription show -g {0} --service-name {1} --sid <banca-retail|banca-empresas|salud-primaria|salud-especialidad> --query primaryKey -o tsv', resourceGroup().name, variables('apimName'))]"
+    }
+  }
+}

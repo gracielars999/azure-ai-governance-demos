@@ -1,0 +1,92 @@
+<policies>
+    <inbound>
+        <!-- 0. CACHÉ SEMÁNTICA (lookup) — variante genérica llm-* (soporta Responses API).
+             En la Responses API el prompt del usuario viaja en "input" (string) o en
+             "input[].content[].text", NO en "messages[]". La política llm-semantic-cache-lookup
+             extrae el texto del request; se mantiene el aislamiento por Unidad de Negocio (vary-by). -->
+        <llm-semantic-cache-lookup score-threshold="0.35" embeddings-backend-id="embeddings-backend" embeddings-backend-auth="system-assigned" ignore-system-messages="true" max-message-count="10">
+            <vary-by>@(context.Subscription != null ? context.Subscription.Id : "anon")</vary-by>
+        </llm-semantic-cache-lookup>
+
+        <base />
+        <!-- 1. SEGURIDAD: autenticación al PLANO DE DATOS DEL AGENTE (Foundry) con Managed Identity.
+             CAMBIO CLAVE: la audiencia ya NO es cognitiveservices.azure.com sino ai.azure.com. -->
+        <authentication-managed-identity resource="https://ai.azure.com" output-token-variable-name="msi-token" ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["msi-token"])</value>
+        </set-header>
+
+        <!-- 2. GOBERNANZA / FINOPS: el límite de tokens por minuto por UNIDAD DE NEGOCIO
+             se inyecta a nivel de PRODUCT vía <base /> (ahora con llm-token-limit). -->
+
+        <!-- 3. Enrutamiento al backend del AGENTE de Foundry (Responses API) -->
+        <set-backend-service backend-id="agente-backend" />
+
+        <!-- 4. FINOPS / OBSERVABILIDAD: métricas de tokens por consumidor (variante genérica).
+             llm-emit-token-metric entiende el esquema de la Responses API. -->
+        <llm-emit-token-metric namespace="banca-ai-gateway">
+            <dimension name="UnidadNegocio" value="@(context.Subscription.Name ?? context.Subscription.Id)" />
+            <dimension name="API" value="@(context.Api.Name)" />
+            <dimension name="Operacion" value="@(context.Operation.Name)" />
+        </llm-emit-token-metric>
+    </inbound>
+    <backend>
+        <forward-request timeout="180" />
+    </backend>
+    <outbound>
+        <!-- ===== Región SOLO-MISS: se OMITE en un HIT semántico ===== -->
+        <base />
+        <set-variable name="cacheMiss" value="1" />
+        <llm-semantic-cache-store duration="3600" />
+
+        <!-- ===== Región COMÚN (HIT y MISS) =====
+             CAMBIO CLAVE: la Responses API reporta usage con input_tokens / output_tokens /
+             total_tokens (NO prompt_tokens / completion_tokens). -->
+        <set-variable name="promptTokens" value="@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b["usage"]?["input_tokens"]?.ToString() ?? "0"); } catch (Exception) { return "0"; } }" />
+        <set-variable name="completionTokens" value="@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b["usage"]?["output_tokens"]?.ToString() ?? "0"); } catch (Exception) { return "0"; } }" />
+        <set-variable name="totalTokens" value="@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b["usage"]?["total_tokens"]?.ToString() ?? "0"); } catch (Exception) { return "0"; } }" />
+        <choose>
+            <when condition="@(context.Variables.ContainsKey("cacheMiss"))">
+                <set-header name="x-cache" exists-action="override">
+                    <value>MISS</value>
+                </set-header>
+                <trace source="banca-ai-gateway" severity="information">
+                    <message>token-usage</message>
+                    <metadata name="UnidadNegocio" value="@(context.Subscription?.Name ?? "n/a")" />
+                    <metadata name="Cache" value="MISS" />
+                    <metadata name="PromptTokens" value="@((string)context.Variables["promptTokens"])" />
+                    <metadata name="CompletionTokens" value="@((string)context.Variables["completionTokens"])" />
+                    <metadata name="TotalTokens" value="@((string)context.Variables["totalTokens"])" />
+                </trace>
+            </when>
+            <otherwise>
+                <set-header name="x-cache" exists-action="override">
+                    <value>HIT</value>
+                </set-header>
+                <trace source="banca-ai-gateway" severity="information">
+                    <message>token-usage</message>
+                    <metadata name="UnidadNegocio" value="@(context.Subscription?.Name ?? "n/a")" />
+                    <metadata name="Cache" value="HIT" />
+                    <metadata name="PromptTokens" value="@((string)context.Variables["promptTokens"])" />
+                    <metadata name="CompletionTokens" value="@((string)context.Variables["completionTokens"])" />
+                    <metadata name="TotalTokens" value="@((string)context.Variables["totalTokens"])" />
+                </trace>
+            </otherwise>
+        </choose>
+    </outbound>
+    <on-error>
+        <base />
+        <choose>
+            <!-- CAMBIO: la fuente del error ahora es la política genérica llm-token-limit -->
+            <when condition="@(context.LastError.Source == "llm-token-limit")">
+                <return-response>
+                    <set-status code="429" reason="Token Limit Exceeded" />
+                    <set-header name="Retry-After" exists-action="override">
+                        <value>60</value>
+                    </set-header>
+                    <set-body>{"error": "Se alcanzó el límite de tokens por minuto (gobernanza de costos del AI Gateway). Intenta de nuevo en un momento."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+    </on-error>
+</policies>

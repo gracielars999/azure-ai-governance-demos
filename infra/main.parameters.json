@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": {
+      "value": "aigov"
+    },
+    "apimPublisherEmail": {
+      "value": "${APIM_PUBLISHER_EMAIL=admin@contoso.com}"
+    },
+    "apimPublisherName": {
+      "value": "Contoso AI Platform"
+    },
+    "chatDeploymentName": {
+      "value": "gpt-4o"
+    },
+    "chatCapacity": {
+      "value": 20
+    },
+    "embeddingDeploymentName": {
+      "value": "text-embedding-3-small"
+    },
+    "embeddingCapacity": {
+      "value": 50
+    },
+    "deploySemanticCache": {
+      "value": true
+    },
+    "buildAppImages": {
+      "value": false
+    },
+    "repoGitUrl": {
+      "value": "https://github.com/gracielars999/azure-ai-governance-demos.git"
+    },
+    "repoBranch": {
+      "value": "main"
+    }
+  }
+}

@@ -1,0 +1,100 @@
+<policies>
+    <inbound>
+        <!-- 0. CACHÉ SEMÁNTICA (lookup) DEL AI GATEWAY:
+             Genera un embedding del último mensaje (text-embedding-3-small) y busca en
+             Azure Managed Redis una pregunta SIMILAR EN SIGNIFICADO (no solo idéntica).
+             En un HIT se sirve la respuesta cacheada: 0 tokens al modelo, 0 costo,
+             respuesta en milisegundos -> AHORRO.
+             vary-by por suscripción => caché AISLADA por unidad de negocio (banca). -->
+        <llm-semantic-cache-lookup score-threshold="0.2" embeddings-backend-id="embeddings-backend" embeddings-backend-auth="system-assigned" ignore-system-messages="true" max-message-count="10">
+            <vary-by>@(context.Subscription != null ? context.Subscription.Id : "anon")</vary-by>
+        </llm-semantic-cache-lookup>
+
+        <base />
+        <!-- 1. SEGURIDAD: autenticación a Foundry/AOAI con Managed Identity (sin llaves) -->
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" output-token-variable-name="msi-token" ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["msi-token"])</value>
+        </set-header>
+
+        <!-- 2. GOBERNANZA / FINOPS: el límite de tokens por minuto se define por
+             UNIDAD DE NEGOCIO a nivel de PRODUCT (Banca-Retail vs Banca-Empresas),
+             y se inyecta aquí mediante <base />. Así cada BU tiene su propia cuota. -->
+
+        <!-- 3. Enrutamiento al backend de Foundry (Azure OpenAI) -->
+        <set-backend-service backend-id="aoai-backend" />
+
+        <!-- 4. FINOPS / OBSERVABILIDAD: métricas de tokens por consumidor a Application Insights -->
+        <azure-openai-emit-token-metric namespace="banca-ai-gateway">
+            <dimension name="UnidadNegocio" value="@(context.Subscription.Name ?? context.Subscription.Id)" />
+            <dimension name="API" value="@(context.Api.Name)" />
+            <dimension name="Operacion" value="@(context.Operation.Name)" />
+        </azure-openai-emit-token-metric>
+    </inbound>
+    <backend>
+        <forward-request timeout="120" />
+    </backend>
+    <outbound>
+        <!-- ===== Región SOLO-MISS: se OMITE por completo en un HIT semántico.
+             En un HIT, la ejecución se reanuda justo DESPUÉS de <llm-semantic-cache-store>,
+             por lo que todo lo de arriba (incluido el conteo de tokens del token-limit vía base)
+             no corre en un HIT -> los HIT no consumen cuota ni tokens del modelo. ===== -->
+        <base />
+        <set-variable name="cacheMiss" value="1" />
+        <!-- Almacena la respuesta + su embedding en Azure Managed Redis para preguntas SIMILARES futuras -->
+        <llm-semantic-cache-store duration="3600" />
+
+        <!-- ===== Región COMÚN: corre en HIT y en MISS ===== -->
+        <!-- Parsear el consumo de tokens (en un HIT provienen de la respuesta cacheada) -->
+        <set-variable name="promptTokens" value="@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b["usage"]?["prompt_tokens"]?.ToString() ?? "0"); } catch (Exception) { return "0"; } }" />
+        <set-variable name="completionTokens" value="@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b["usage"]?["completion_tokens"]?.ToString() ?? "0"); } catch (Exception) { return "0"; } }" />
+        <set-variable name="totalTokens" value="@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b["usage"]?["total_tokens"]?.ToString() ?? "0"); } catch (Exception) { return "0"; } }" />
+        <choose>
+            <when condition="@(context.Variables.ContainsKey("cacheMiss"))">
+                <!-- MISS: la respuesta vino del modelo (Foundry) y se acaba de almacenar -->
+                <set-header name="x-cache" exists-action="override">
+                    <value>MISS</value>
+                </set-header>
+                <trace source="banca-ai-gateway" severity="information">
+                    <message>token-usage</message>
+                    <metadata name="Solucion" value="Banca" />
+                    <metadata name="UnidadNegocio" value="@(context.Subscription?.Name ?? "n/a")" />
+                    <metadata name="Cache" value="MISS" />
+                    <metadata name="PromptTokens" value="@((string)context.Variables["promptTokens"])" />
+                    <metadata name="CompletionTokens" value="@((string)context.Variables["completionTokens"])" />
+                    <metadata name="TotalTokens" value="@((string)context.Variables["totalTokens"])" />
+                </trace>
+            </when>
+            <otherwise>
+                <!-- HIT SEMÁNTICO: respuesta servida desde Azure Managed Redis por SIMILITUD de significado.
+                     0 tokens al modelo, 0 costo, respuesta en milisegundos -> AHORRO. -->
+                <set-header name="x-cache" exists-action="override">
+                    <value>HIT</value>
+                </set-header>
+                <trace source="banca-ai-gateway" severity="information">
+                    <message>token-usage</message>
+                    <metadata name="Solucion" value="Banca" />
+                    <metadata name="UnidadNegocio" value="@(context.Subscription?.Name ?? "n/a")" />
+                    <metadata name="Cache" value="HIT" />
+                    <metadata name="PromptTokens" value="@((string)context.Variables["promptTokens"])" />
+                    <metadata name="CompletionTokens" value="@((string)context.Variables["completionTokens"])" />
+                    <metadata name="TotalTokens" value="@((string)context.Variables["totalTokens"])" />
+                </trace>
+            </otherwise>
+        </choose>
+    </outbound>
+    <on-error>
+        <base />
+        <choose>
+            <when condition="@(context.LastError.Source == "azure-openai-token-limit")">
+                <return-response>
+                    <set-status code="429" reason="Token Limit Exceeded" />
+                    <set-header name="Retry-After" exists-action="override">
+                        <value>60</value>
+                    </set-header>
+                    <set-body>{"error": "Se alcanzó el límite de tokens por minuto (gobernanza de costos del AI Gateway). Intenta de nuevo en un momento."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+    </on-error>
+</policies>

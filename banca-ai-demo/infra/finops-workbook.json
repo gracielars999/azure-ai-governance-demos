@@ -1,0 +1,104 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# 💰 AI FinOps · Banco Contoso\n\nConsumo y **costo estimado de IA** gobernado por el **AI Gateway (Azure API Management)**.\nCada llamada al modelo de **Azure AI Foundry** pasa por el gateway, que emite métricas de tokens a **Application Insights**, etiquetadas por **Unidad de Negocio** (Retail / Empresas).\n\n> Precios de referencia gpt-4o: entrada `$0.0025 USD / 1K tokens`, salida `$0.010 USD / 1K tokens`. Ajusta según tu contrato EA/MCA."
+      },
+      "name": "titulo"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "rango",
+            "version": "KqlParameterItem/1.0",
+            "name": "Rango",
+            "type": 4,
+            "value": { "durationMs": 86400000 },
+            "typeSettings": {
+              "selectableValues": [
+                { "durationMs": 3600000 },
+                { "durationMs": 14400000 },
+                { "durationMs": 86400000 },
+                { "durationMs": 604800000 }
+              ]
+            }
+          }
+        ],
+        "style": "pills"
+      },
+      "name": "parametros"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where timestamp {Rango}\n| where message == \"token-usage\"\n| where tostring(customDimensions[\"Solucion\"]) == \"Banca\"\n| extend BU = tostring(customDimensions[\"UnidadNegocio\"]), Total = toint(customDimensions[\"TotalTokens\"])\n| summarize Tokens = sum(Total) by BU\n| order by Tokens desc",
+        "size": 1,
+        "title": "Tokens totales por Unidad de Negocio",
+        "visualization": "barchart",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components"
+      },
+      "name": "tokens-por-bu"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where timestamp {Rango}\n| where message == \"token-usage\"\n| where tostring(customDimensions[\"Solucion\"]) == \"Banca\"\n| extend BU = tostring(customDimensions[\"UnidadNegocio\"]), Total = toint(customDimensions[\"TotalTokens\"])\n| summarize Tokens = sum(Total) by bin(timestamp, 5m), BU\n| render timechart",
+        "size": 0,
+        "title": "Consumo de tokens en el tiempo (por Unidad de Negocio)",
+        "visualization": "timechart",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components"
+      },
+      "name": "tokens-tiempo"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where timestamp {Rango}\n| where message == \"token-usage\"\n| where tostring(customDimensions[\"Solucion\"]) == \"Banca\"\n| extend BU = tostring(customDimensions[\"UnidadNegocio\"]), P = toint(customDimensions[\"PromptTokens\"]), C = toint(customDimensions[\"CompletionTokens\"]), T = toint(customDimensions[\"TotalTokens\"])\n| summarize Prompt = sum(P), Completion = sum(C), Total = sum(T), Llamadas = count() by BU\n| extend [\"Costo USD\"] = round(Prompt/1000.0*0.0025 + Completion/1000.0*0.010, 4)\n| extend [\"Costo MXN\"] = round([\"Costo USD\"]*18.5, 2)\n| project [\"Unidad de Negocio\"]=BU, [\"Tokens entrada\"]=Prompt, [\"Tokens salida\"]=Completion, [\"Tokens total\"]=Total, Llamadas, [\"Costo USD\"], [\"Costo MXN\"]\n| order by [\"Costo USD\"] desc",
+        "size": 0,
+        "title": "Costo estimado por Unidad de Negocio (chargeback)",
+        "visualization": "table",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components"
+      },
+      "name": "costo-por-bu"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "traces\n| where timestamp {Rango}\n| where message == \"token-usage\"\n| where tostring(customDimensions[\"Solucion\"]) == \"Banca\"\n| extend Cache = tostring(customDimensions[\"Cache\"]), P = toint(customDimensions[\"PromptTokens\"]), C = toint(customDimensions[\"CompletionTokens\"]), T = toint(customDimensions[\"TotalTokens\"])\n| summarize Llamadas = count(), HITs = countif(Cache==\"HIT\"), [\"Tokens ahorrados\"] = sumif(T, Cache==\"HIT\"), [\"Costo evitado USD\"] = round(sumif(P, Cache==\"HIT\")/1000.0*0.0025 + sumif(C, Cache==\"HIT\")/1000.0*0.010, 4)\n| extend [\"Hit rate %\"] = iff(Llamadas>0, round(100.0*HITs/Llamadas,1), 0.0), [\"Costo evitado MXN\"] = round([\"Costo evitado USD\"]*18.5, 2)\n| project Llamadas, [\"Aciertos caché\"]=HITs, [\"Hit rate %\"], [\"Tokens ahorrados\"], [\"Costo evitado USD\"], [\"Costo evitado MXN\"]",
+        "size": 0,
+        "title": "💚 Ahorro por caché semántica del AI Gateway",
+        "visualization": "table",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components"
+      },
+      "name": "ahorro-cache"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "requests\n| where timestamp {Rango}\n| where url has \"/banca/\"\n| summarize Llamadas = count(), [\"Latencia p95 (ms)\"] = round(percentile(duration, 95),0), [\"Exito %\"] = round(100.0*countif(success==true)/count(),1) by [\"Operacion\"]=name\n| order by Llamadas desc",
+        "size": 0,
+        "title": "Volumen, latencia y éxito por operación del gateway",
+        "visualization": "table",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components"
+      },
+      "name": "volumen-latencia"
+    }
+  ],
+  "fallbackResourceIds": [],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

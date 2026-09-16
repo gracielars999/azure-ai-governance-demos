@@ -1,0 +1,27 @@
+# Azure Developer CLI
+.azure/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secretos / salidas de despliegue reales (usa los *.example.md como plantilla)
+**/deployment-outputs.md
+*.env
+.env
+.env.*
+
+# Node
+node_modules/
+
+# Bicep intermedios
+infra/main.json
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.log
