@@ -8,7 +8,7 @@
 
 ---
 
-## Embarques de clientes (autoservicio)
+## Embarques individuales (operación diaria)
 
 ### ALM-100234
 | Campo | Valor |

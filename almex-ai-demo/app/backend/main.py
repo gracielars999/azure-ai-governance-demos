@@ -46,7 +46,26 @@ PRICE_INPUT_PER_1K = float(os.environ.get("PRICE_INPUT_PER_1K", "0.0025"))
 PRICE_OUTPUT_PER_1K = float(os.environ.get("PRICE_OUTPUT_PER_1K", "0.010"))
 USD_TO_MXN = float(os.environ.get("USD_TO_MXN", "18.5"))
 
-BU_LABELS = {"clientes": "Clientes (Autoservicio)", "corporativo": "Cuentas Corporativas"}
+BU_LABELS = {"clientes": "Logística Interna", "corporativo": "Cuentas Corporativas"}
+
+# Contexto de sesión inyectado al system prompt según la unidad de negocio (acceso gobernado).
+# Nota: las llaves internas siguen siendo "clientes"/"corporativo" para no recrear los productos
+# de APIM ni cambiar las App Settings SUBKEY_*; la etiqueta de cara al usuario ya es la nueva.
+BU_CONTEXT = {
+    "clientes": (
+        "CONTEXTO DE SESIÓN: quien consulta pertenece a **Logística Interna (Management)** de ALMEX. "
+        "Tiene acceso al **Panel de Logística Interna** (revenue, costo operativo, margen, puntualidad e "
+        "incidencias por cliente). Responde preguntas gerenciales de negocio (qué cliente genera más revenue, "
+        "márgenes, costo por embarque, puntualidad y clientes a vigilar) con las cifras del panel y su insight. "
+        "Estos datos financieros son internos y confidenciales."
+    ),
+    "corporativo": (
+        "CONTEXTO DE SESIÓN: quien consulta pertenece a **Cuentas Corporativas (Operaciones)** de ALMEX. "
+        "Tiene acceso al **Panel Operativo Corporativo** (embarques en tránsito, entregas en riesgo de retraso, "
+        "incidencias por sucursal) y al rastreo de guías individuales. **No** reveles datos financieros de "
+        "revenue/margen/costos por cliente: son exclusivos de Logística Interna (Management)."
+    ),
+}
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -110,6 +129,9 @@ def chat(req: ChatRequest):
         return JSONResponse(status_code=503, content={"error": f"Falta la subscription key para la unidad '{bu}'."})
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    bu_ctx = BU_CONTEXT.get(bu)
+    if bu_ctx:
+        messages.append({"role": "system", "content": bu_ctx})
     if SEND_HISTORY:
         for turn in (req.history or [])[-8:]:
             role = turn.get("role")

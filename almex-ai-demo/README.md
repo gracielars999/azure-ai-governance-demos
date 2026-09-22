@@ -1,22 +1,29 @@
-# Demo Logística — Agente "Alma" (Clientes de ALMEX)
+# Demo Logística — Agente "Alma" (Asistente Interno de ALMEX)
 
-Aplicación web de chat donde **Alma**, la asistente de **ALMEX** (Almacenamiento y Mensajería Express), atiende a **clientes** con **rastreo de embarques**: ubicación, fecha estimada de llegada (ETA), incidencias y cambios de dirección de entrega — respondiendo **solo** con base en la documentación operativa aprobada (knowledge grounding).
+Aplicación web de chat donde **Alma**, el asistente interno de **ALMEX** (Almacenamiento y Mensajería Express), atiende a **usuarios internos** en dos unidades de negocio gobernadas: **Logística Interna (Management)** con analítica de negocio (revenue, costo, margen, puntualidad e incidencias por cliente) y **Cuentas Corporativas (Operaciones)** con el estado operativo del portafolio (embarques en tránsito, entregas en riesgo, incidencias por sucursal) y rastreo de guías — respondiendo **solo** con base en los paneles y documentación aprobados (knowledge grounding).
 
 Es una de las tres demos de la plataforma compartida. Para desplegar, usa el **[README principal](../README.md)** (botón *Deploy to Azure*, `azd up` o CLI).
 
 ## Qué demuestra
 
-- **Gobernanza por tipo de cuenta:** dos productos de APIM con cuota distinta — **Clientes / Autoservicio** (10 000 TPM) y **Cuentas Corporativas** (40 000 TPM).
+- **Gobernanza por unidad de negocio:** dos productos de APIM con cuota distinta — **Logística Interna** (10 000 TPM) y **Cuentas Corporativas** (40 000 TPM) — con **aislamiento de datos**: los datos financieros por cliente son exclusivos de Management.
 - **Seguridad keyless:** APIM llama a Azure OpenAI con **Managed Identity**.
 - **Caché semántica:** consultas similares se sirven desde Azure Managed Redis (0 tokens).
 - **FinOps:** trazas `token-usage` con la dimensión `Solucion=Almex` y `Cache=HIT/MISS` → Workbook `infra/finops-workbook.json`.
 
 ## Preguntas que responde
 
-- ¿Dónde viene mi embarque? (ubicación / última lectura)
-- ¿Cuál es la fecha estimada de llegada? (ETA)
-- ¿Hubo alguna incidencia?
-- ¿Puedo cambiar la dirección de entrega?
+**Logística Interna (Management):**
+- ¿Cuál cliente genera más revenue este mes?
+- ¿Qué cliente tiene el mejor margen y cuál el peor?
+- ¿Qué cliente tiene el peor desempeño de entregas a tiempo?
+- ¿Cuál es el costo operativo y el costo por embarque por cliente?
+
+**Cuentas Corporativas (Operaciones):**
+- ¿Cuántos embarques tengo en tránsito?
+- ¿Cuáles entregas tienen riesgo de retraso?
+- ¿Qué sucursal está generando más incidencias?
+- ¿Dónde viene mi embarque / cuál es su ETA? (rastreo de guías)
 
 ## Estructura
 

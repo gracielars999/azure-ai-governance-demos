@@ -23,24 +23,25 @@ function Send-Q($msg, $bu) {
 }
 
 # (unidad, pregunta, sleepDespues) — las parafrasis van justo despues del original para forzar HIT
+# clientes  = Logistica Interna (Management)   | corporativo = Cuentas Corporativas (Operaciones)
 $plan = @(
-  @("clientes",    "Donde viene mi embarque ALM-100234?",10),
-  @("clientes",    "En que parte del trayecto va mi guia ALM-100234?",10),      # HIT parafrasis
-  @("corporativo", "Cual es el ETA de la guia ALM-CORP-77012?",30),
-  @("clientes",    "Cual es la fecha estimada de llegada de ALM-100239?",10),
-  @("clientes",    "Cuando llega aproximadamente mi paquete ALM-100239?",10),   # HIT parafrasis
-  @("clientes",    "Hubo alguna incidencia con mi envio ALM-100236?",12),
-  @("clientes",    "Mi guia ALM-100236 tuvo algun problema?",10),               # HIT parafrasis
-  @("clientes",    "Puedo cambiar la direccion de entrega de ALM-100234?",30),
-  @("clientes",    "Se puede modificar el domicilio de entrega de ALM-100234?",12), # HIT parafrasis
-  @("clientes",    "Mi paquete ALM-100237 va a llegar tarde?",12),
-  @("corporativo", "Estatus del embarque corporativo ALM-CORP-77013?",30),
-  @("corporativo", "Como va la ruta de ALM-CORP-77013?",12),                    # HIT parafrasis
-  @("clientes",    "Ya entregaron mi paquete ALM-100238?",10),
-  @("clientes",    "Mi paquete llego danado, que hago?",30),
+  @("clientes",    "Cual cliente genera mas revenue este mes?",10),
+  @("clientes",    "Que cliente factura mas este mes?",10),                     # HIT parafrasis
+  @("corporativo", "Cuantos embarques tengo en transito?",30),
+  @("corporativo", "Cuantos envios van en camino actualmente?",10),            # HIT parafrasis
+  @("clientes",    "Que cliente tiene el mejor margen y cual el peor?",12),
+  @("clientes",    "Cual cliente es mas y menos rentable por margen?",10),     # HIT parafrasis
+  @("corporativo", "Cuales entregas tienen riesgo de retraso?",30),
+  @("corporativo", "Que embarques podrian llegar tarde?",12),                  # HIT parafrasis
+  @("clientes",    "Que cliente tiene el peor desempeno de entregas a tiempo?",12),
+  @("corporativo", "Que sucursal esta generando mas incidencias?",30),
+  @("corporativo", "Cual CEDIS concentra mas problemas?",12),                  # HIT parafrasis
+  @("clientes",    "Cual es el costo operativo y el costo por embarque por cliente?",12),
+  @("clientes",    "Cual cliente hay que vigilar por bajo desempeno?",12),
+  @("corporativo", "Donde viene mi embarque ALM-CORP-77012?",30),
+  @("corporativo", "Cual es el ETA de la guia ALM-CORP-77012?",12),           # HIT parafrasis
   @("corporativo", "La guia ALM-CORP-77014 tiene alguna incidencia?",12),
-  @("clientes",    "No tengo mi numero de guia, me puedes ayudar?",12),
-  @("clientes",    "Puedo reprogramar la entrega de ALM-100235?",10)
+  @("clientes",    "Dame el ranking de clientes por revenue.",10)
 )
 
 $i = 0
