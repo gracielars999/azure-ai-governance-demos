@@ -56,6 +56,9 @@ param bancaImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 @description('Imagen de contenedor para la app de Salud.')
 param saludImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
+@description('Imagen de contenedor para la app de Logística (ALMEX).')
+param almexImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
+
 @description('Construir automáticamente las imágenes de las apps desde el repo público y actualizarlas (botón one-click).')
 param buildAppImages bool = true
 
@@ -79,6 +82,7 @@ var apimName = '${namePrefix}-apim-${suffix}'
 var acaEnvName = '${namePrefix}-cae-${suffix}'
 var bancaAppName = 'ca-banca-web'
 var saludAppName = 'ca-salud-web'
+var almexAppName = 'ca-almex-web'
 var uamiName = '${namePrefix}-deploy-${suffix}'
 
 var cognitiveServicesUserRoleId = 'a97b65f3-24c7-4388-baec-2e87135dc908'
@@ -328,6 +332,46 @@ resource apiSaludPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-0
   }
 }
 
+// ---- API Almex (Logística y Transporte) ------------------------------------
+resource apiAlmex 'Microsoft.ApiManagement/service/apis@2024-05-01' = {
+  parent: apim
+  name: 'almex'
+  properties: {
+    displayName: 'Almex AI Gateway'
+    path: 'almex'
+    protocols: [ 'https' ]
+    subscriptionRequired: true
+    serviceUrl: aoaiBaseUrl
+    subscriptionKeyParameterNames: {
+      header: 'Ocp-Apim-Subscription-Key'
+      query: 'subscription-key'
+    }
+  }
+}
+
+resource opAlmex 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' = {
+  parent: apiAlmex
+  name: 'chat-completions'
+  properties: {
+    displayName: 'Chat Completions'
+    method: 'POST'
+    urlTemplate: '/deployments/{deployment-id}/chat/completions'
+    templateParameters: [
+      { name: 'deployment-id', required: true, type: 'string' }
+    ]
+  }
+}
+
+resource apiAlmexPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = {
+  parent: apiAlmex
+  name: 'policy'
+  dependsOn: [ backendAoai, backendEmbeddings, apimCache ]
+  properties: {
+    format: 'rawxml'
+    value: loadTextContent('../almex-ai-demo/infra/apim-policy-core.xml')
+  }
+}
+
 // ---- Productos (gobernanza por unidad de negocio) --------------------------
 // (producto, apiId, policyFile) -> se genera producto + link + política + suscripción
 var products = [
@@ -335,6 +379,8 @@ var products = [
   { id: 'banca-empresas',     display: 'Banca Empresas',     api: 'banca', policy: loadTextContent('../banca-ai-demo/infra/apim-policy-product-empresas.xml') }
   { id: 'salud-primaria',     display: 'Salud Atención Primaria', api: 'salud', policy: loadTextContent('../salud-ai-demo/infra/apim-policy-product-primaria.xml') }
   { id: 'salud-especialidad', display: 'Salud Especialidad', api: 'salud', policy: loadTextContent('../salud-ai-demo/infra/apim-policy-product-especialidad.xml') }
+  { id: 'almex-clientes',     display: 'Almex Clientes (Autoservicio)', api: 'almex', policy: loadTextContent('../almex-ai-demo/infra/apim-policy-product-clientes.xml') }
+  { id: 'almex-corporativo',  display: 'Almex Cuentas Corporativas', api: 'almex', policy: loadTextContent('../almex-ai-demo/infra/apim-policy-product-corporativo.xml') }
 ]
 
 resource apimProducts 'Microsoft.ApiManagement/service/products@2024-05-01' = [for p in products: {
@@ -351,7 +397,7 @@ resource apimProducts 'Microsoft.ApiManagement/service/products@2024-05-01' = [f
 
 resource apimProductApis 'Microsoft.ApiManagement/service/products/apis@2024-05-01' = [for (p, i) in products: {
   name: '${apimName}/${p.id}/${p.api}'
-  dependsOn: [ apimProducts[i], apiBanca, apiSalud ]
+  dependsOn: [ apimProducts[i], apiBanca, apiSalud, apiAlmex ]
 }]
 
 resource apimProductPolicies 'Microsoft.ApiManagement/service/products/policies@2024-05-01' = [for (p, i) in products: {
@@ -461,6 +507,42 @@ resource saludApp 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+resource almexApp 'Microsoft.App/containerApps@2024-03-01' = {
+  name: almexAppName
+  location: location
+  identity: { type: 'SystemAssigned' }
+  tags: { 'azd-service-name': 'almex' }
+  properties: {
+    managedEnvironmentId: acaEnv.id
+    configuration: {
+      ingress: { external: true, targetPort: 8000, transport: 'auto' }
+      registries: [ { server: acr.properties.loginServer, identity: 'system' } ]
+      secrets: [
+        { name: 'subkey-clientes', value: apimSubscriptions[4].listSecrets().primaryKey }
+        { name: 'subkey-corporativo', value: apimSubscriptions[5].listSecrets().primaryKey }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'web'
+          image: almexImage
+          resources: { cpu: json('0.5'), memory: '1Gi' }
+          env: [
+            { name: 'APIM_GATEWAY_URL', value: gatewayUrl }
+            { name: 'APIM_API_PATH', value: 'almex' }
+            { name: 'MODEL_DEPLOYMENT', value: chatDeploymentName }
+            { name: 'SEND_HISTORY', value: '0' }
+            { name: 'SUBKEY_CLIENTES', secretRef: 'subkey-clientes' }
+            { name: 'SUBKEY_CORPORATIVO', secretRef: 'subkey-corporativo' }
+          ]
+        }
+      ]
+      scale: { minReplicas: 1, maxReplicas: 2 }
+    }
+  }
+}
+
 // ACR pull (keyless) para las Container Apps
 resource bancaAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(acr.id, bancaApp.id, acrPullRoleId)
@@ -478,6 +560,16 @@ resource saludAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
     principalId: saludApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource almexAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, almexApp.id, acrPullRoleId)
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: almexApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }
@@ -520,6 +612,7 @@ resource buildScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = if (bu
       { name: 'BRANCH', value: repoBranch }
       { name: 'BANCA_APP', value: bancaAppName }
       { name: 'SALUD_APP', value: saludAppName }
+      { name: 'ALMEX_APP', value: almexAppName }
     ]
     scriptContent: '''
       set -e
@@ -527,9 +620,12 @@ resource buildScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = if (bu
       az acr build --registry "$ACR" --image banca-web:latest "${REPO}#${BRANCH}:banca-ai-demo"
       echo "Construyendo imagen de Salud..."
       az acr build --registry "$ACR" --image salud-web:latest "${REPO}#${BRANCH}:salud-ai-demo"
+      echo "Construyendo imagen de Almex..."
+      az acr build --registry "$ACR" --image almex-web:latest "${REPO}#${BRANCH}:almex-ai-demo"
       echo "Actualizando Container Apps con las imágenes reales..."
       az containerapp update -g "$RG" -n "$BANCA_APP" --image "${ACR_SERVER}/banca-web:latest"
       az containerapp update -g "$RG" -n "$SALUD_APP" --image "${ACR_SERVER}/salud-web:latest"
+      az containerapp update -g "$RG" -n "$ALMEX_APP" --image "${ACR_SERVER}/almex-web:latest"
       echo "Listo."
     '''
   }
@@ -544,6 +640,7 @@ output AZURE_CONTAINER_REGISTRY_ENDPOINT string = acr.properties.loginServer
 output AZURE_CONTAINER_REGISTRY_NAME string = acr.name
 output bancaAppUrl string = 'https://${bancaApp.properties.configuration.ingress.fqdn}'
 output saludAppUrl string = 'https://${saludApp.properties.configuration.ingress.fqdn}'
+output almexAppUrl string = 'https://${almexApp.properties.configuration.ingress.fqdn}'
 output foundryEndpoint string = aiServices.properties.endpoint
 output resourceGroupName string = resourceGroup().name
-output howToGetKeys string = 'az apim subscription show -g ${resourceGroup().name} --service-name ${apimName} --sid <banca-retail|banca-empresas|salud-primaria|salud-especialidad> --query primaryKey -o tsv'
+output howToGetKeys string = 'az apim subscription show -g ${resourceGroup().name} --service-name ${apimName} --sid <banca-retail|banca-empresas|salud-primaria|salud-especialidad|almex-clientes|almex-corporativo> --query primaryKey -o tsv'

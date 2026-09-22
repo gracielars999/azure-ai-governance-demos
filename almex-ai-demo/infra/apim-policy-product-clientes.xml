@@ -1,0 +1,25 @@
+<policies>
+    <inbound>
+        <base />
+        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Clientes (autoservicio) = cuota baja (10.000 TPM) -->
+        <azure-openai-token-limit
+            tokens-per-minute="10000"
+            counter-key="@(context.Subscription.Id)"
+            estimate-prompt-tokens="true"
+            tokens-consumed-header-name="x-tokens-consumed"
+            remaining-tokens-header-name="x-tokens-remaining"
+            retry-after-header-name="Retry-After" />
+        <set-header name="x-unidad-negocio" exists-action="override">
+            <value>Almex-Clientes</value>
+        </set-header>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

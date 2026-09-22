@@ -32,22 +32,28 @@ az acr build --registry "$ACR" --image banca-web:latest "${REPO}#${BRANCH}:banca
 echo "==> Construyendo imagen de Salud (Iris) desde el repo público..."
 az acr build --registry "$ACR" --image salud-web:latest "${REPO}#${BRANCH}:salud-ai-demo"
 
+echo "==> Construyendo imagen de Logística (Alma) desde el repo público..."
+az acr build --registry "$ACR" --image almex-web:latest "${REPO}#${BRANCH}:almex-ai-demo"
+
 echo "==> Actualizando las Container Apps con las imágenes reales..."
 az containerapp update -g "$RG" -n ca-banca-web --image "${ACR_SERVER}/banca-web:latest" -o none
 az containerapp update -g "$RG" -n ca-salud-web --image "${ACR_SERVER}/salud-web:latest" -o none
+az containerapp update -g "$RG" -n ca-almex-web --image "${ACR_SERVER}/almex-web:latest" -o none
 
 BANCA_URL=$(az containerapp show -g "$RG" -n ca-banca-web --query properties.configuration.ingress.fqdn -o tsv)
 SALUD_URL=$(az containerapp show -g "$RG" -n ca-salud-web --query properties.configuration.ingress.fqdn -o tsv)
+ALMEX_URL=$(az containerapp show -g "$RG" -n ca-almex-web --query properties.configuration.ingress.fqdn -o tsv)
 APIM=$(az apim list -g "$RG" --query "[0].name" -o tsv)
 
 echo ""
 echo "============================================================"
 echo " Despliegue completo."
-echo "   App Banca (Aria):  https://${BANCA_URL}"
-echo "   App Salud (Iris):  https://${SALUD_URL}"
+echo "   App Banca (Aria):       https://${BANCA_URL}"
+echo "   App Salud (Iris):       https://${SALUD_URL}"
+echo "   App Logística (Alma):   https://${ALMEX_URL}"
 echo ""
 echo " Llaves de suscripción por unidad de negocio (gobernanza):"
-for SID in banca-retail banca-empresas salud-primaria salud-especialidad; do
+for SID in banca-retail banca-empresas salud-primaria salud-especialidad almex-clientes almex-corporativo; do
   KEY=$(az apim subscription show -g "$RG" --service-name "$APIM" --sid "$SID" --query primaryKey -o tsv 2>/dev/null || echo "n/d")
   echo "   ${SID}: ${KEY}"
 done

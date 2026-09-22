@@ -28,22 +28,28 @@ az acr build --registry $acr --image banca-web:latest "$RepoGitUrl#${Branch}:ban
 Write-Host "==> Construyendo imagen de Salud (Iris)..."
 az acr build --registry $acr --image salud-web:latest "$RepoGitUrl#${Branch}:salud-ai-demo"
 
+Write-Host "==> Construyendo imagen de Logística (Alma)..."
+az acr build --registry $acr --image almex-web:latest "$RepoGitUrl#${Branch}:almex-ai-demo"
+
 Write-Host "==> Actualizando las Container Apps con las imágenes reales..."
 az containerapp update -g $ResourceGroup -n ca-banca-web --image "$acrServer/banca-web:latest" -o none
 az containerapp update -g $ResourceGroup -n ca-salud-web --image "$acrServer/salud-web:latest" -o none
+az containerapp update -g $ResourceGroup -n ca-almex-web --image "$acrServer/almex-web:latest" -o none
 
 $bancaUrl = az containerapp show -g $ResourceGroup -n ca-banca-web --query properties.configuration.ingress.fqdn -o tsv
 $saludUrl = az containerapp show -g $ResourceGroup -n ca-salud-web --query properties.configuration.ingress.fqdn -o tsv
+$almexUrl = az containerapp show -g $ResourceGroup -n ca-almex-web --query properties.configuration.ingress.fqdn -o tsv
 $apim = az apim list -g $ResourceGroup --query "[0].name" -o tsv
 
 Write-Host ""
 Write-Host "============================================================"
 Write-Host " Despliegue completo."
-Write-Host "   App Banca (Aria):  https://$bancaUrl"
-Write-Host "   App Salud (Iris):  https://$saludUrl"
+Write-Host "   App Banca (Aria):       https://$bancaUrl"
+Write-Host "   App Salud (Iris):       https://$saludUrl"
+Write-Host "   App Logística (Alma):   https://$almexUrl"
 Write-Host ""
 Write-Host " Llaves de suscripción por unidad de negocio (gobernanza):"
-foreach ($sid in @("banca-retail","banca-empresas","salud-primaria","salud-especialidad")) {
+foreach ($sid in @("banca-retail","banca-empresas","salud-primaria","salud-especialidad","almex-clientes","almex-corporativo")) {
     $key = az apim subscription show -g $ResourceGroup --service-name $apim --sid $sid --query primaryKey -o tsv 2>$null
     if (-not $key) { $key = "n/d" }
     Write-Host "   ${sid}: $key"

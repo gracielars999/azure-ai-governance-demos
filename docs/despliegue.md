@@ -1,6 +1,6 @@
 # Guía de despliegue detallada
 
-Esta guía explica, paso a paso, cómo desplegar las **dos demos de IA gobernada** (Banca + Salud) sobre una plataforma compartida en tu propio tenant de Azure.
+Esta guía explica, paso a paso, cómo desplegar las **tres demos de IA gobernada** (Banca + Salud + Logística) sobre una plataforma compartida en tu propio tenant de Azure.
 
 ---
 
@@ -29,7 +29,7 @@ Esta guía explica, paso a paso, cómo desplegar las **dos demos de IA gobernada
    | `deploySemanticCache` | `true` |
    | `chatCapacity` | `20` (bájalo si tienes poca cuota) |
 4. **Revisar + crear**. El despliegue tarda **~35–45 min**.
-5. Al terminar, ve a *Outputs* para obtener `bancaAppUrl` y `saludAppUrl`.
+5. Al terminar, ve a *Outputs* para obtener `bancaAppUrl`, `saludAppUrl` y `almexAppUrl`.
 
 > Si `buildAppImages` quedó en `false`, corre `scripts/postdeploy.sh <rg>` (o `.ps1`) una vez para construir las imágenes y conectarlas.
 
@@ -44,7 +44,7 @@ azd auth login
 azd up
 ```
 
-`azd` te pedirá entorno, suscripción y región; luego provisiona la infraestructura y **construye + despliega** ambas apps. Las URLs quedan en la salida de `azd up`.
+`azd` te pedirá entorno, suscripción y región; luego provisiona la infraestructura y **construye + despliega** las tres apps. Las URLs quedan en la salida de `azd up`.
 
 Para eliminar todo: `azd down --purge`.
 
@@ -70,7 +70,7 @@ az deployment group create -g rg-ai-gov \
 
 ## 5. Verificar la demo
 
-1. **Apps arriba:** abre `bancaAppUrl` y `saludAppUrl`. Deberías ver el chat de Aria / Iris.
+1. **Apps arriba:** abre `bancaAppUrl`, `saludAppUrl` y `almexAppUrl`. Deberías ver el chat de Aria / Iris / Alma.
 2. **Prueba de gobernanza:** en la app, haz varias preguntas seguidas para acercarte al límite de TPM del producto; verás el aviso 429 controlado.
 3. **Prueba de caché semántica:** repite una pregunta con otras palabras pero igual significado; la segunda debería responder más rápido (HIT) — revísalo en el Workbook.
 
@@ -81,9 +81,9 @@ az deployment group create -g rg-ai-gov \
 1. Portal → **Azure Monitor → Workbooks → Nuevo**.
 2. Botón **</> Editor avanzado** → pega el contenido de `banca-ai-demo/infra/finops-workbook.json` → **Aplicar**.
 3. **Guardar** apuntando el recurso al **Application Insights** desplegado (`aigov-appi-*`).
-4. Repite con `salud-ai-demo/infra/finops-workbook.json`.
+4. Repite con `salud-ai-demo/infra/finops-workbook.json` y `almex-ai-demo/infra/finops-workbook.json`.
 
-El Workbook muestra: tokens por unidad de negocio/división, costo y **chargeback** (USD/MXN), **ahorro por caché semántica** y latencia. Cada Workbook filtra por su `Solucion` (`Banca` / `Salud`).
+El Workbook muestra: tokens por unidad de negocio/división, costo y **chargeback** (USD/MXN), **ahorro por caché semántica** y latencia. Cada Workbook filtra por su `Solucion` (`Banca` / `Salud` / `Almex`).
 
 ---
 
@@ -91,6 +91,7 @@ El Workbook muestra: tokens por unidad de negocio/división, costo y **chargebac
 
 ```powershell
 ./salud-ai-demo/infra/gen-traffic.ps1 -Base https://<saludAppUrl>
+./almex-ai-demo/infra/gen-traffic.ps1 -Base https://<almexAppUrl>
 ```
 
 Genera consultas variadas con repeticiones (para provocar HIT de caché) y así poblar las estadísticas. Puedes hacer lo mismo manualmente desde la app de banca.
@@ -110,7 +111,7 @@ En `scripts/foundry-agent/` hay utilidades para crear un **agente de Foundry con
 | La app muestra error 500 al chatear | imágenes aún no construidas (placeholder) | corre `scripts/postdeploy.sh <rg>` |
 | 401/403 de APIM a Foundry | el *role assignment* de Managed Identity tarda en propagar | espera 5–10 min y reintenta |
 | Falla el despliegue del modelo | cuota insuficiente | baja `chatCapacity` / cambia de región |
-| No hay HIT de caché | umbral muy bajo o historial reenviado | verifica `SEND_HISTORY=0` (salud) y el `score-threshold` en `apim-policy-core.xml` |
+| No hay HIT de caché | umbral muy bajo o historial reenviado | verifica `SEND_HISTORY=0` (salud/almex) y el `score-threshold` en `apim-policy-core.xml` |
 | El Workbook sale vacío | sin tráfico o App Insights equivocado | genera tráfico y confirma el recurso del Workbook |
 
 ---
