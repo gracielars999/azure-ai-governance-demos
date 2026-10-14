@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
 # Azure Developer CLI (azd) — despliegue en un solo comando: `azd up`
-# Construye las tres imágenes, provisiona la plataforma compartida y despliega
-# las tres apps (Aria / Banca, Iris / Salud y Alma / Logística) sobre el mismo AI Gateway.
+# Construye las cuatro imágenes, provisiona la plataforma compartida y despliega
+# Aria, Iris, Alma y BIA sobre el mismo AI Gateway.
 name: azure-ai-governance-demos
 metadata:
   template: azure-ai-governance-demos@1.0.0
@@ -28,6 +28,13 @@ services:
       context: .
   almex:
     project: ./almex-ai-demo
+    language: docker
+    host: containerapp
+    docker:
+      path: ./Dockerfile
+      context: .
+  bocar:
+    project: ./bocar-ai-demo
     language: docker
     host: containerapp
     docker:

@@ -1,14 +1,15 @@
-# Demos de IA Gobernada en Azure — Banca, Salud y Logística 🇲🇽🇪🇸
+# Demos de IA Gobernada en Azure — Banca, Salud, Logística y Manufactura 🇲🇽🇪🇸
 
-Tres demos en **español** que muestran, sobre **una misma plataforma de AI Gateway**, cómo Azure gobierna, asegura y controla el costo de aplicaciones de IA generativa empresarial.
+Cuatro demos en **español** que muestran, sobre **una misma plataforma de AI Gateway**, cómo Azure gobierna, asegura y controla el costo de aplicaciones de IA generativa empresarial.
 
 | Demo | Agente | Escenario | Unidades de negocio |
 |------|--------|-----------|---------------------|
 | **Banca** | **Aria** | Disputas y reembolsos de tarjetas — Banco Contoso | Retail (10K TPM) · Empresas (40K TPM) |
 | **Salud** | **Iris** | Información de productos médicos para visitadores médicos — Laboratorios Contoso | Atención Primaria (10K TPM) · Especialidad (40K TPM) |
-| **Logística** | **Alma** | Rastreo de embarques para clientes — ALMEX (Almacenamiento y Mensajería Express) | Clientes/Autoservicio (10K TPM) · Corporativo (40K TPM) |
+| **Logística** | **Alma** | Analítica interna y operación de embarques — ALMEX | Logística Interna (10K TPM) · Cuentas Corporativas (40K TPM) |
+| **Manufactura** | **BIA** | Scrap/retrabajo, mantenimiento predictivo y RFQ — Bocar | Producción y Calidad (30K TPM) · Mantenimiento (20K TPM) · Cotizaciones (15K TPM) |
 
-Las tres comparten **una sola instancia** de Azure API Management, Azure OpenAI (Foundry), Azure Managed Redis, Application Insights y Container Apps Environment.
+Las cuatro comparten **una sola instancia** de Azure API Management, Azure OpenAI (Foundry), Azure Managed Redis, Application Insights y Container Apps Environment.
 
 ---
 
@@ -18,7 +19,7 @@ Las tres comparten **una sola instancia** de Azure API Management, Azure OpenAI 
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fgracielars999%2Fazure-ai-governance-demos%2Fmain%2Fazuredeploy.json)
 
-El botón provisiona **toda la plataforma** (Foundry + APIM + Redis + Container Apps + observabilidad), construye las imágenes de las tres apps desde este repo y las conecta al gateway. Solo necesitas elegir suscripción, grupo de recursos y región.
+El botón provisiona **toda la plataforma** (Foundry + APIM + Redis + Container Apps + observabilidad), construye las imágenes de las cuatro apps desde este repo y las conecta al gateway. Solo necesitas elegir suscripción, grupo de recursos y región.
 
 > ⏱️ El despliegue tarda **~35–45 min** (API Management es el componente más lento).
 > 💡 Deja `buildAppImages = true` (valor por defecto) para que la demo quede lista y funcionando de una sola vez.
@@ -31,7 +32,7 @@ cd azure-ai-governance-demos
 azd up
 ```
 
-`azd up` provisiona la infraestructura y construye/despliega las tres apps automáticamente.
+`azd up` provisiona la infraestructura y construye/despliega las cuatro apps automáticamente.
 
 ### Opción C — Azure CLI (manual)
 
@@ -66,11 +67,13 @@ flowchart LR
         B[App Banca - Aria]
         S[App Salud - Iris]
         A[App Logística - Alma]
+        M[App Manufactura - BIA]
     end
     subgraph GW[Azure API Management - AI Gateway]
         PB[Producto Banca Retail / Empresas]
         PS[Producto Salud Primaria / Especialidad]
         PA[Producto Almex Clientes / Corporativo]
+        PM[Productos Bocar Producción / Mantenimiento / Cotizaciones]
         CACHE[[Caché semántica]]
     end
     REDIS[(Azure Managed Redis + RediSearch)]
@@ -81,6 +84,7 @@ flowchart LR
     B -- "Ocp-Apim-Subscription-Key" --> GW
     S -- "Ocp-Apim-Subscription-Key" --> GW
     A -- "Ocp-Apim-Subscription-Key" --> GW
+    M -- "Ocp-Apim-Subscription-Key" --> GW
     GW -- "Managed Identity (keyless)" --> FO
     CACHE <--> REDIS
     GW -- "trazas token-usage + métricas" --> AI
@@ -93,15 +97,16 @@ flowchart LR
 
 ## ✅ Después de desplegar
 
-1. **URLs de las apps** — salen en los *outputs* del despliegue (`bancaAppUrl`, `saludAppUrl`, `almexAppUrl`) o con:
+1. **URLs de las apps** — salen en los *outputs* del despliegue (`bancaAppUrl`, `saludAppUrl`, `almexAppUrl`, `bocarAppUrl`) o con:
    ```bash
    az containerapp show -g rg-ai-gov -n ca-banca-web --query properties.configuration.ingress.fqdn -o tsv
    ```
-2. **Importa el Workbook de FinOps** — sube `banca-ai-demo/infra/finops-workbook.json`, `salud-ai-demo/infra/finops-workbook.json` y `almex-ai-demo/infra/finops-workbook.json` en *Azure Monitor → Workbooks → Nuevo → Editor avanzado*, apuntando al Application Insights desplegado.
+2. **Importa el Workbook de FinOps** — sube el `infra/finops-workbook.json` de cada demo (incluido `bocar-ai-demo`) en *Azure Monitor → Workbooks → Nuevo → Editor avanzado*, apuntando al Application Insights desplegado.
 3. **Genera tráfico** (para poblar las estadísticas):
    ```powershell
    ./salud-ai-demo/infra/gen-traffic.ps1 -Base https://<saludAppUrl>
    ./almex-ai-demo/infra/gen-traffic.ps1 -Base https://<almexAppUrl>
+   ./bocar-ai-demo/infra/gen-traffic.ps1 -Base https://<bocarAppUrl>
    ```
 4. **Llaves por unidad de negocio** (si las necesitas fuera de la app):
    ```bash
@@ -141,10 +146,11 @@ azure-ai-governance-demos/
 ├─ banca-ai-demo/            # app Aria + políticas + knowledge + workbook + guía
 ├─ salud-ai-demo/            # app Iris + políticas + knowledge + workbook + gen-traffic
 ├─ almex-ai-demo/            # app Alma + políticas + knowledge + workbook + gen-traffic
+├─ bocar-ai-demo/            # app BIA + casos de manufactura + workbook + guía
 └─ docs/despliegue.md        # guía detallada
 ```
 
-Cada demo tiene su propio README: **[banca-ai-demo](banca-ai-demo/README.md)** · **[salud-ai-demo](salud-ai-demo/README.md)** · **[almex-ai-demo](almex-ai-demo/README.md)**.
+Cada demo tiene su propio README: **[banca-ai-demo](banca-ai-demo/README.md)** · **[salud-ai-demo](salud-ai-demo/README.md)** · **[almex-ai-demo](almex-ai-demo/README.md)** · **[bocar-ai-demo](bocar-ai-demo/README.md)**.
 
 ---
 
@@ -158,4 +164,4 @@ Cada demo tiene su propio README: **[banca-ai-demo](banca-ai-demo/README.md)** �
 
 ## 📄 Licencia
 
-[MIT](LICENSE). Demo con fines educativos y de habilitación; los datos, políticas y nombres ("Banco Contoso", "Laboratorios Contoso", "ALMEX") son **ficticios**.
+[MIT](LICENSE). Demo con fines educativos y de habilitación. Todos los datos operativos, clientes, activos, órdenes, lotes y RFQ son **ficticios**. Bocar se usa únicamente como contexto de demostración solicitado por el usuario.

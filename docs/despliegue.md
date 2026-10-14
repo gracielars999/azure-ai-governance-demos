@@ -1,6 +1,6 @@
 # Guía de despliegue detallada
 
-Esta guía explica, paso a paso, cómo desplegar las **tres demos de IA gobernada** (Banca + Salud + Logística) sobre una plataforma compartida en tu propio tenant de Azure.
+Esta guía explica, paso a paso, cómo desplegar las **cuatro demos de IA gobernada** (Banca + Salud + Logística + Manufactura) sobre una plataforma compartida en tu propio tenant de Azure.
 
 ---
 
@@ -29,7 +29,7 @@ Esta guía explica, paso a paso, cómo desplegar las **tres demos de IA gobernad
    | `deploySemanticCache` | `true` |
    | `chatCapacity` | `20` (bájalo si tienes poca cuota) |
 4. **Revisar + crear**. El despliegue tarda **~35–45 min**.
-5. Al terminar, ve a *Outputs* para obtener `bancaAppUrl`, `saludAppUrl` y `almexAppUrl`.
+5. Al terminar, ve a *Outputs* para obtener `bancaAppUrl`, `saludAppUrl`, `almexAppUrl` y `bocarAppUrl`.
 
 > Si `buildAppImages` quedó en `false`, corre `scripts/postdeploy.sh <rg>` (o `.ps1`) una vez para construir las imágenes y conectarlas.
 
@@ -44,7 +44,7 @@ azd auth login
 azd up
 ```
 
-`azd` te pedirá entorno, suscripción y región; luego provisiona la infraestructura y **construye + despliega** las tres apps. Las URLs quedan en la salida de `azd up`.
+`azd` te pedirá entorno, suscripción y región; luego provisiona la infraestructura y **construye + despliega** las cuatro apps. Las URLs quedan en la salida de `azd up`.
 
 Para eliminar todo: `azd down --purge`.
 
@@ -70,7 +70,7 @@ az deployment group create -g rg-ai-gov \
 
 ## 5. Verificar la demo
 
-1. **Apps arriba:** abre `bancaAppUrl`, `saludAppUrl` y `almexAppUrl`. Deberías ver el chat de Aria / Iris / Alma.
+1. **Apps arriba:** abre `bancaAppUrl`, `saludAppUrl`, `almexAppUrl` y `bocarAppUrl`. Deberías ver el chat de Aria / Iris / Alma / BIA.
 2. **Prueba de gobernanza:** en la app, haz varias preguntas seguidas para acercarte al límite de TPM del producto; verás el aviso 429 controlado.
 3. **Prueba de caché semántica:** repite una pregunta con otras palabras pero igual significado; la segunda debería responder más rápido (HIT) — revísalo en el Workbook.
 
@@ -92,6 +92,7 @@ El Workbook muestra: tokens por unidad de negocio/división, costo y **chargebac
 ```powershell
 ./salud-ai-demo/infra/gen-traffic.ps1 -Base https://<saludAppUrl>
 ./almex-ai-demo/infra/gen-traffic.ps1 -Base https://<almexAppUrl>
+./bocar-ai-demo/infra/gen-traffic.ps1 -Base https://<bocarAppUrl>
 ```
 
 Genera consultas variadas con repeticiones (para provocar HIT de caché) y así poblar las estadísticas. Puedes hacer lo mismo manualmente desde la app de banca.

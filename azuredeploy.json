@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.41.2.15936",
-      "templateHash": "6318870583292165346"
+      "templateHash": "8025057377702053867"
     }
   },
   "parameters": {
@@ -109,6 +109,13 @@
         "description": "Imagen de contenedor para la app de Logística (ALMEX)."
       }
     },
+    "bocarImage": {
+      "type": "string",
+      "defaultValue": "mcr.microsoft.com/k8se/quickstart:latest",
+      "metadata": {
+        "description": "Imagen de contenedor para la app de Manufactura (Bocar)."
+      }
+    },
     "buildAppImages": {
       "type": "bool",
       "defaultValue": true,
@@ -141,13 +148,17 @@
   "variables": {
     "$fxv#0": "<policies>\r\n    <inbound>\r\n        <!-- 0. CACHÉ SEMÁNTICA (lookup) DEL AI GATEWAY:\r\n             Genera un embedding del último mensaje (text-embedding-3-small) y busca en\r\n             Azure Managed Redis una pregunta SIMILAR EN SIGNIFICADO (no solo idéntica).\r\n             En un HIT se sirve la respuesta cacheada: 0 tokens al modelo, 0 costo,\r\n             respuesta en milisegundos -> AHORRO.\r\n             vary-by por suscripción => caché AISLADA por unidad de negocio (banca). -->\r\n        <llm-semantic-cache-lookup score-threshold=\"0.2\" embeddings-backend-id=\"embeddings-backend\" embeddings-backend-auth=\"system-assigned\" ignore-system-messages=\"true\" max-message-count=\"10\">\r\n            <vary-by>@(context.Subscription != null ? context.Subscription.Id : \"anon\")</vary-by>\r\n        </llm-semantic-cache-lookup>\r\n\r\n        <base />\r\n        <!-- 1. SEGURIDAD: autenticación a Foundry/AOAI con Managed Identity (sin llaves) -->\r\n        <authentication-managed-identity resource=\"https://cognitiveservices.azure.com\" output-token-variable-name=\"msi-token\" ignore-error=\"false\" />\r\n        <set-header name=\"Authorization\" exists-action=\"override\">\r\n            <value>@(\"Bearer \" + (string)context.Variables[\"msi-token\"])</value>\r\n        </set-header>\r\n\r\n        <!-- 2. GOBERNANZA / FINOPS: el límite de tokens por minuto se define por\r\n             UNIDAD DE NEGOCIO a nivel de PRODUCT (Banca-Retail vs Banca-Empresas),\r\n             y se inyecta aquí mediante <base />. Así cada BU tiene su propia cuota. -->\r\n\r\n        <!-- 3. Enrutamiento al backend de Foundry (Azure OpenAI) -->\r\n        <set-backend-service backend-id=\"aoai-backend\" />\r\n\r\n        <!-- 4. FINOPS / OBSERVABILIDAD: métricas de tokens por consumidor a Application Insights -->\r\n        <azure-openai-emit-token-metric namespace=\"banca-ai-gateway\">\r\n            <dimension name=\"UnidadNegocio\" value=\"@(context.Subscription.Name ?? context.Subscription.Id)\" />\r\n            <dimension name=\"API\" value=\"@(context.Api.Name)\" />\r\n            <dimension name=\"Operacion\" value=\"@(context.Operation.Name)\" />\r\n        </azure-openai-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <forward-request timeout=\"120\" />\r\n    </backend>\r\n    <outbound>\r\n        <!-- ===== Región SOLO-MISS: se OMITE por completo en un HIT semántico.\r\n             En un HIT, la ejecución se reanuda justo DESPUÉS de <llm-semantic-cache-store>,\r\n             por lo que todo lo de arriba (incluido el conteo de tokens del token-limit vía base)\r\n             no corre en un HIT -> los HIT no consumen cuota ni tokens del modelo. ===== -->\r\n        <base />\r\n        <set-variable name=\"cacheMiss\" value=\"1\" />\r\n        <!-- Almacena la respuesta + su embedding en Azure Managed Redis para preguntas SIMILARES futuras -->\r\n        <llm-semantic-cache-store duration=\"3600\" />\r\n\r\n        <!-- ===== Región COMÚN: corre en HIT y en MISS ===== -->\r\n        <!-- Parsear el consumo de tokens (en un HIT provienen de la respuesta cacheada) -->\r\n        <set-variable name=\"promptTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"prompt_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"completionTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"completion_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"totalTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"total_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <choose>\r\n            <when condition=\"@(context.Variables.ContainsKey(\"cacheMiss\"))\">\r\n                <!-- MISS: la respuesta vino del modelo (Foundry) y se acaba de almacenar -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>MISS</value>\r\n                </set-header>\r\n                <trace source=\"banca-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Banca\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"MISS\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </when>\r\n            <otherwise>\r\n                <!-- HIT SEMÁNTICO: respuesta servida desde Azure Managed Redis por SIMILITUD de significado.\r\n                     0 tokens al modelo, 0 costo, respuesta en milisegundos -> AHORRO. -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>HIT</value>\r\n                </set-header>\r\n                <trace source=\"banca-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Banca\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"HIT\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </otherwise>\r\n        </choose>\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n        <choose>\r\n            <when condition=\"@(context.LastError.Source == \"azure-openai-token-limit\")\">\r\n                <return-response>\r\n                    <set-status code=\"429\" reason=\"Token Limit Exceeded\" />\r\n                    <set-header name=\"Retry-After\" exists-action=\"override\">\r\n                        <value>60</value>\r\n                    </set-header>\r\n                    <set-body>{\"error\": \"Se alcanzó el límite de tokens por minuto (gobernanza de costos del AI Gateway). Intenta de nuevo en un momento.\"}</set-body>\r\n                </return-response>\r\n            </when>\r\n        </choose>\r\n    </on-error>\r\n</policies>\r\n",
     "$fxv#1": "<policies>\r\n    <inbound>\r\n        <!-- 0. CACHÉ SEMÁNTICA (lookup) DEL AI GATEWAY:\r\n             Genera un embedding del último mensaje (text-embedding-3-small) y busca en\r\n             Azure Managed Redis una pregunta SIMILAR EN SIGNIFICADO (no solo idéntica).\r\n             En un HIT se sirve la respuesta cacheada: 0 tokens al modelo, 0 costo,\r\n             respuesta en milisegundos -> AHORRO.\r\n             vary-by por suscripción => caché AISLADA por división / línea. -->\r\n        <llm-semantic-cache-lookup score-threshold=\"0.2\" embeddings-backend-id=\"embeddings-backend\" embeddings-backend-auth=\"system-assigned\" ignore-system-messages=\"true\" max-message-count=\"10\">\r\n            <vary-by>@(context.Subscription != null ? context.Subscription.Id : \"anon\")</vary-by>\r\n        </llm-semantic-cache-lookup>\r\n\r\n        <base />\r\n        <!-- 1. SEGURIDAD: autenticación a Foundry/AOAI con Managed Identity (sin llaves) -->\r\n        <authentication-managed-identity resource=\"https://cognitiveservices.azure.com\" output-token-variable-name=\"msi-token\" ignore-error=\"false\" />\r\n        <set-header name=\"Authorization\" exists-action=\"override\">\r\n            <value>@(\"Bearer \" + (string)context.Variables[\"msi-token\"])</value>\r\n        </set-header>\r\n\r\n        <!-- 2. GOBERNANZA / FINOPS: el límite de tokens por minuto se define por\r\n             DIVISIÓN / LÍNEA a nivel de PRODUCT (Salud-Primaria vs Salud-Especialidad),\r\n             y se inyecta aquí mediante <base />. Así cada división tiene su propia cuota. -->\r\n\r\n        <!-- 3. Enrutamiento al backend de Foundry (Azure OpenAI) -->\r\n        <set-backend-service backend-id=\"aoai-backend\" />\r\n\r\n        <!-- 4. FINOPS / OBSERVABILIDAD: métricas de tokens por consumidor a Application Insights -->\r\n        <azure-openai-emit-token-metric namespace=\"salud-ai-gateway\">\r\n            <dimension name=\"UnidadNegocio\" value=\"@(context.Subscription.Name ?? context.Subscription.Id)\" />\r\n            <dimension name=\"API\" value=\"@(context.Api.Name)\" />\r\n            <dimension name=\"Operacion\" value=\"@(context.Operation.Name)\" />\r\n        </azure-openai-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <forward-request timeout=\"120\" />\r\n    </backend>\r\n    <outbound>\r\n        <!-- ===== Región SOLO-MISS: se OMITE por completo en un HIT semántico.\r\n             En un HIT, la ejecución se reanuda justo DESPUÉS de <llm-semantic-cache-store>,\r\n             por lo que todo lo de arriba (incluido el conteo de tokens del token-limit vía base)\r\n             no corre en un HIT -> los HIT no consumen cuota ni tokens del modelo. ===== -->\r\n        <base />\r\n        <set-variable name=\"cacheMiss\" value=\"1\" />\r\n        <!-- Almacena la respuesta + su embedding en Azure Managed Redis para preguntas SIMILARES futuras -->\r\n        <llm-semantic-cache-store duration=\"3600\" />\r\n\r\n        <!-- ===== Región COMÚN: corre en HIT y en MISS ===== -->\r\n        <!-- Parsear el consumo de tokens (en un HIT provienen de la respuesta cacheada) -->\r\n        <set-variable name=\"promptTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"prompt_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"completionTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"completion_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"totalTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"total_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <choose>\r\n            <when condition=\"@(context.Variables.ContainsKey(\"cacheMiss\"))\">\r\n                <!-- MISS: la respuesta vino del modelo (Foundry) y se acaba de almacenar -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>MISS</value>\r\n                </set-header>\r\n                <trace source=\"salud-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Salud\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"MISS\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </when>\r\n            <otherwise>\r\n                <!-- HIT SEMÁNTICO: respuesta servida desde Azure Managed Redis por SIMILITUD de significado.\r\n                     0 tokens al modelo, 0 costo, respuesta en milisegundos -> AHORRO. -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>HIT</value>\r\n                </set-header>\r\n                <trace source=\"salud-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Salud\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"HIT\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </otherwise>\r\n        </choose>\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n        <choose>\r\n            <when condition=\"@(context.LastError.Source == \"azure-openai-token-limit\")\">\r\n                <return-response>\r\n                    <set-status code=\"429\" reason=\"Token Limit Exceeded\" />\r\n                    <set-header name=\"Retry-After\" exists-action=\"override\">\r\n                        <value>60</value>\r\n                    </set-header>\r\n                    <set-body>{\"error\": \"Se alcanzó el límite de tokens por minuto (gobernanza de costos del AI Gateway). Intenta de nuevo en un momento.\"}</set-body>\r\n                </return-response>\r\n            </when>\r\n        </choose>\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#10": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"30000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Bocar-Produccion-Calidad</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend><base /></backend>\r\n    <outbound><base /></outbound>\r\n    <on-error><base /></on-error>\r\n</policies>\r\n",
+    "$fxv#11": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"20000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Bocar-Mantenimiento-Predictivo</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend><base /></backend>\r\n    <outbound><base /></outbound>\r\n    <on-error><base /></on-error>\r\n</policies>\r\n",
+    "$fxv#12": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"15000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Bocar-Ingenieria-Cotizaciones</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend><base /></backend>\r\n    <outbound><base /></outbound>\r\n    <on-error><base /></on-error>\r\n</policies>\r\n",
     "$fxv#2": "<policies>\r\n    <inbound>\r\n        <!-- 0. CACHÉ SEMÁNTICA (lookup) DEL AI GATEWAY:\r\n             Genera un embedding del último mensaje (text-embedding-3-small) y busca en\r\n             Azure Managed Redis una pregunta SIMILAR EN SIGNIFICADO (no solo idéntica).\r\n             En un HIT se sirve la respuesta cacheada: 0 tokens al modelo, 0 costo,\r\n             respuesta en milisegundos -> AHORRO.\r\n             vary-by por suscripción => caché AISLADA por unidad de negocio. -->\r\n        <llm-semantic-cache-lookup score-threshold=\"0.2\" embeddings-backend-id=\"embeddings-backend\" embeddings-backend-auth=\"system-assigned\" ignore-system-messages=\"true\" max-message-count=\"10\">\r\n            <vary-by>@(context.Subscription != null ? context.Subscription.Id : \"anon\")</vary-by>\r\n        </llm-semantic-cache-lookup>\r\n\r\n        <base />\r\n        <!-- 1. SEGURIDAD: autenticación a Foundry/AOAI con Managed Identity (sin llaves) -->\r\n        <authentication-managed-identity resource=\"https://cognitiveservices.azure.com\" output-token-variable-name=\"msi-token\" ignore-error=\"false\" />\r\n        <set-header name=\"Authorization\" exists-action=\"override\">\r\n            <value>@(\"Bearer \" + (string)context.Variables[\"msi-token\"])</value>\r\n        </set-header>\r\n\r\n        <!-- 2. GOBERNANZA / FINOPS: el límite de tokens por minuto se define por\r\n             UNIDAD DE NEGOCIO a nivel de PRODUCT (Almex-Clientes vs Almex-Corporativo),\r\n             y se inyecta aquí mediante <base />. Así cada unidad tiene su propia cuota. -->\r\n\r\n        <!-- 3. Enrutamiento al backend de Foundry (Azure OpenAI) -->\r\n        <set-backend-service backend-id=\"aoai-backend\" />\r\n\r\n        <!-- 4. FINOPS / OBSERVABILIDAD: métricas de tokens por consumidor a Application Insights -->\r\n        <azure-openai-emit-token-metric namespace=\"almex-ai-gateway\">\r\n            <dimension name=\"UnidadNegocio\" value=\"@(context.Subscription.Name ?? context.Subscription.Id)\" />\r\n            <dimension name=\"API\" value=\"@(context.Api.Name)\" />\r\n            <dimension name=\"Operacion\" value=\"@(context.Operation.Name)\" />\r\n        </azure-openai-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <forward-request timeout=\"120\" />\r\n    </backend>\r\n    <outbound>\r\n        <!-- ===== Región SOLO-MISS: se OMITE por completo en un HIT semántico.\r\n             En un HIT, la ejecución se reanuda justo DESPUÉS de <llm-semantic-cache-store>,\r\n             por lo que todo lo de arriba (incluido el conteo de tokens del token-limit vía base)\r\n             no corre en un HIT -> los HIT no consumen cuota ni tokens del modelo. ===== -->\r\n        <base />\r\n        <set-variable name=\"cacheMiss\" value=\"1\" />\r\n        <!-- Almacena la respuesta + su embedding en Azure Managed Redis para preguntas SIMILARES futuras -->\r\n        <llm-semantic-cache-store duration=\"3600\" />\r\n\r\n        <!-- ===== Región COMÚN: corre en HIT y en MISS ===== -->\r\n        <!-- Parsear el consumo de tokens (en un HIT provienen de la respuesta cacheada) -->\r\n        <set-variable name=\"promptTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"prompt_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"completionTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"completion_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"totalTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"total_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <choose>\r\n            <when condition=\"@(context.Variables.ContainsKey(\"cacheMiss\"))\">\r\n                <!-- MISS: la respuesta vino del modelo (Foundry) y se acaba de almacenar -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>MISS</value>\r\n                </set-header>\r\n                <trace source=\"almex-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Almex\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"MISS\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </when>\r\n            <otherwise>\r\n                <!-- HIT SEMÁNTICO: respuesta servida desde Azure Managed Redis por SIMILITUD de significado.\r\n                     0 tokens al modelo, 0 costo, respuesta en milisegundos -> AHORRO. -->\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>HIT</value>\r\n                </set-header>\r\n                <trace source=\"almex-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Almex\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"HIT\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </otherwise>\r\n        </choose>\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n        <choose>\r\n            <when condition=\"@(context.LastError.Source == \"azure-openai-token-limit\")\">\r\n                <return-response>\r\n                    <set-status code=\"429\" reason=\"Token Limit Exceeded\" />\r\n                    <set-header name=\"Retry-After\" exists-action=\"override\">\r\n                        <value>60</value>\r\n                    </set-header>\r\n                    <set-body>{\"error\": \"Se alcanzó el límite de tokens por minuto (gobernanza de costos del AI Gateway). Intenta de nuevo en un momento.\"}</set-body>\r\n                </return-response>\r\n            </when>\r\n        </choose>\r\n    </on-error>\r\n</policies>\r\n",
-    "$fxv#3": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Banca Retail = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Banca-Retail</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
-    "$fxv#4": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Banca Empresas = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Banca-Empresas</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
-    "$fxv#5": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR DIVISIÓN: Atención Primaria = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Salud-Primaria</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
-    "$fxv#6": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR DIVISIÓN: Especialidad = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Salud-Especialidad</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
-    "$fxv#7": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Clientes (autoservicio) = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Almex-Clientes</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
-    "$fxv#8": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Corporativo (cuentas con contrato) = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Almex-Corporativo</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#3": "<policies>\r\n    <inbound>\r\n        <!-- Caché semántica aislada por suscripción/dominio. -->\r\n        <llm-semantic-cache-lookup score-threshold=\"0.2\" embeddings-backend-id=\"embeddings-backend\" embeddings-backend-auth=\"system-assigned\" ignore-system-messages=\"true\" max-message-count=\"10\">\r\n            <vary-by>@(context.Subscription != null ? context.Subscription.Id : \"anon\")</vary-by>\r\n        </llm-semantic-cache-lookup>\r\n\r\n        <base />\r\n        <authentication-managed-identity resource=\"https://cognitiveservices.azure.com\" output-token-variable-name=\"msi-token\" ignore-error=\"false\" />\r\n        <set-header name=\"Authorization\" exists-action=\"override\">\r\n            <value>@(\"Bearer \" + (string)context.Variables[\"msi-token\"])</value>\r\n        </set-header>\r\n        <set-backend-service backend-id=\"aoai-backend\" />\r\n        <azure-openai-emit-token-metric namespace=\"bocar-ai-gateway\">\r\n            <dimension name=\"UnidadNegocio\" value=\"@(context.Subscription.Name ?? context.Subscription.Id)\" />\r\n            <dimension name=\"API\" value=\"@(context.Api.Name)\" />\r\n            <dimension name=\"Operacion\" value=\"@(context.Operation.Name)\" />\r\n        </azure-openai-emit-token-metric>\r\n    </inbound>\r\n    <backend>\r\n        <forward-request timeout=\"120\" />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n        <set-variable name=\"cacheMiss\" value=\"1\" />\r\n        <llm-semantic-cache-store duration=\"3600\" />\r\n        <set-variable name=\"promptTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"prompt_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"completionTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"completion_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <set-variable name=\"totalTokens\" value=\"@{ try { var b = context.Response.Body.As&lt;JObject&gt;(preserveContent: true); return (string)(b[\"usage\"]?[\"total_tokens\"]?.ToString() ?? \"0\"); } catch (Exception) { return \"0\"; } }\" />\r\n        <choose>\r\n            <when condition=\"@(context.Variables.ContainsKey(\"cacheMiss\"))\">\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>MISS</value>\r\n                </set-header>\r\n                <trace source=\"bocar-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Bocar\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"MISS\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </when>\r\n            <otherwise>\r\n                <set-header name=\"x-cache\" exists-action=\"override\">\r\n                    <value>HIT</value>\r\n                </set-header>\r\n                <trace source=\"bocar-ai-gateway\" severity=\"information\">\r\n                    <message>token-usage</message>\r\n                    <metadata name=\"Solucion\" value=\"Bocar\" />\r\n                    <metadata name=\"UnidadNegocio\" value=\"@(context.Subscription?.Name ?? \"n/a\")\" />\r\n                    <metadata name=\"Cache\" value=\"HIT\" />\r\n                    <metadata name=\"PromptTokens\" value=\"@((string)context.Variables[\"promptTokens\"])\" />\r\n                    <metadata name=\"CompletionTokens\" value=\"@((string)context.Variables[\"completionTokens\"])\" />\r\n                    <metadata name=\"TotalTokens\" value=\"@((string)context.Variables[\"totalTokens\"])\" />\r\n                </trace>\r\n            </otherwise>\r\n        </choose>\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n        <choose>\r\n            <when condition=\"@(context.LastError.Source == \"azure-openai-token-limit\")\">\r\n                <return-response>\r\n                    <set-status code=\"429\" reason=\"Token Limit Exceeded\" />\r\n                    <set-header name=\"Retry-After\" exists-action=\"override\">\r\n                        <value>60</value>\r\n                    </set-header>\r\n                    <set-body>{\"error\":\"Se alcanzó el límite de tokens por minuto del dominio.\"}</set-body>\r\n                </return-response>\r\n            </when>\r\n        </choose>\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#4": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Banca Retail = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Banca-Retail</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#5": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Banca Empresas = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Banca-Empresas</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#6": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR DIVISIÓN: Atención Primaria = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Salud-Primaria</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#7": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR DIVISIÓN: Especialidad = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Salud-Especialidad</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#8": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Clientes (autoservicio) = cuota baja (10.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"10000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Almex-Clientes</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
+    "$fxv#9": "<policies>\r\n    <inbound>\r\n        <base />\r\n        <!-- GOBERNANZA POR UNIDAD DE NEGOCIO: Corporativo (cuentas con contrato) = cuota alta (40.000 TPM) -->\r\n        <azure-openai-token-limit\r\n            tokens-per-minute=\"40000\"\r\n            counter-key=\"@(context.Subscription.Id)\"\r\n            estimate-prompt-tokens=\"true\"\r\n            tokens-consumed-header-name=\"x-tokens-consumed\"\r\n            remaining-tokens-header-name=\"x-tokens-remaining\"\r\n            retry-after-header-name=\"Retry-After\" />\r\n        <set-header name=\"x-unidad-negocio\" exists-action=\"override\">\r\n            <value>Almex-Corporativo</value>\r\n        </set-header>\r\n    </inbound>\r\n    <backend>\r\n        <base />\r\n    </backend>\r\n    <outbound>\r\n        <base />\r\n    </outbound>\r\n    <on-error>\r\n        <base />\r\n    </on-error>\r\n</policies>\r\n",
     "suffix": "[toLower(parameters('resourceSuffix'))]",
     "lawName": "[format('{0}-law-{1}', parameters('namePrefix'), variables('suffix'))]",
     "appInsightsName": "[format('{0}-appi-{1}', parameters('namePrefix'), variables('suffix'))]",
@@ -159,6 +170,7 @@
     "bancaAppName": "ca-banca-web",
     "saludAppName": "ca-salud-web",
     "almexAppName": "ca-almex-web",
+    "bocarAppName": "ca-bocar-web",
     "uamiName": "[format('{0}-deploy-{1}', parameters('namePrefix'), variables('suffix'))]",
     "cognitiveServicesUserRoleId": "a97b65f3-24c7-4388-baec-2e87135dc908",
     "acrPullRoleId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
@@ -168,37 +180,55 @@
         "id": "banca-retail",
         "display": "Banca Retail",
         "api": "banca",
-        "policy": "[variables('$fxv#3')]"
+        "policy": "[variables('$fxv#4')]"
       },
       {
         "id": "banca-empresas",
         "display": "Banca Empresas",
         "api": "banca",
-        "policy": "[variables('$fxv#4')]"
+        "policy": "[variables('$fxv#5')]"
       },
       {
         "id": "salud-primaria",
         "display": "Salud Atención Primaria",
         "api": "salud",
-        "policy": "[variables('$fxv#5')]"
+        "policy": "[variables('$fxv#6')]"
       },
       {
         "id": "salud-especialidad",
         "display": "Salud Especialidad",
         "api": "salud",
-        "policy": "[variables('$fxv#6')]"
+        "policy": "[variables('$fxv#7')]"
       },
       {
         "id": "almex-clientes",
         "display": "Almex Clientes (Autoservicio)",
         "api": "almex",
-        "policy": "[variables('$fxv#7')]"
+        "policy": "[variables('$fxv#8')]"
       },
       {
         "id": "almex-corporativo",
         "display": "Almex Cuentas Corporativas",
         "api": "almex",
-        "policy": "[variables('$fxv#8')]"
+        "policy": "[variables('$fxv#9')]"
+      },
+      {
+        "id": "bocar-produccion",
+        "display": "Bocar Producción y Calidad",
+        "api": "bocar",
+        "policy": "[variables('$fxv#10')]"
+      },
+      {
+        "id": "bocar-mantenimiento",
+        "display": "Bocar Mantenimiento Predictivo",
+        "api": "bocar",
+        "policy": "[variables('$fxv#11')]"
+      },
+      {
+        "id": "bocar-cotizaciones",
+        "display": "Bocar Ingeniería y Cotizaciones",
+        "api": "bocar",
+        "policy": "[variables('$fxv#12')]"
       }
     ],
     "gatewayUrl": "[format('https://{0}.azure-api.net', variables('apimName'))]"
@@ -610,6 +640,63 @@
       ]
     },
     {
+      "type": "Microsoft.ApiManagement/service/apis",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}', variables('apimName'), 'bocar')]",
+      "properties": {
+        "displayName": "Bocar AI Gateway",
+        "path": "bocar",
+        "protocols": [
+          "https"
+        ],
+        "subscriptionRequired": true,
+        "serviceUrl": "[format('{0}openai', reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), '2024-10-01').endpoint)]",
+        "subscriptionKeyParameterNames": {
+          "header": "Ocp-Apim-Subscription-Key",
+          "query": "subscription-key"
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiName'))]",
+        "[resourceId('Microsoft.ApiManagement/service', variables('apimName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis/operations",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/{2}', variables('apimName'), 'bocar', 'chat-completions')]",
+      "properties": {
+        "displayName": "Chat Completions",
+        "method": "POST",
+        "urlTemplate": "/deployments/{deployment-id}/chat/completions",
+        "templateParameters": [
+          {
+            "name": "deployment-id",
+            "required": true,
+            "type": "string"
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'bocar')]"
+      ]
+    },
+    {
+      "type": "Microsoft.ApiManagement/service/apis/policies",
+      "apiVersion": "2024-05-01",
+      "name": "[format('{0}/{1}/{2}', variables('apimName'), 'bocar', 'policy')]",
+      "properties": {
+        "format": "rawxml",
+        "value": "[variables('$fxv#3')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'bocar')]",
+        "[resourceId('Microsoft.ApiManagement/service/caches', variables('apimName'), parameters('location'))]",
+        "[resourceId('Microsoft.ApiManagement/service/backends', variables('apimName'), 'aoai-backend')]",
+        "[resourceId('Microsoft.ApiManagement/service/backends', variables('apimName'), 'embeddings-backend')]"
+      ]
+    },
+    {
       "copy": {
         "name": "apimProducts",
         "count": "[length(variables('products'))]"
@@ -639,6 +726,7 @@
       "dependsOn": [
         "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'almex')]",
         "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'banca')]",
+        "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'bocar')]",
         "[resourceId('Microsoft.ApiManagement/service/products', variables('apimName'), variables('products')[copyIndex()].id)]",
         "[resourceId('Microsoft.ApiManagement/service/apis', variables('apimName'), 'salud')]"
       ]
@@ -773,8 +861,8 @@
       "dependsOn": [
         "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
         "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
-        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[1])]",
-        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[1])]"
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[0].id), '/')[1])]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[1].id), '/')[1])]"
       ]
     },
     {
@@ -945,8 +1033,103 @@
       "dependsOn": [
         "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
         "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
-        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[4].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[4].id), '/')[1])]",
-        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[5].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[5].id), '/')[1])]"
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[5].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[5].id), '/')[1])]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[4].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[4].id), '/')[1])]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('bocarAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "tags": {
+        "azd-service-name": "bocar"
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 8000,
+            "transport": "auto"
+          },
+          "registries": [
+            {
+              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), '2023-07-01').loginServer]",
+              "identity": "system"
+            }
+          ],
+          "secrets": [
+            {
+              "name": "subkey-produccion",
+              "value": "[listSecrets(resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[6].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[6].id), '/')[1]), '2024-05-01').primaryKey]"
+            },
+            {
+              "name": "subkey-mantenimiento",
+              "value": "[listSecrets(resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[7].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[7].id), '/')[1]), '2024-05-01').primaryKey]"
+            },
+            {
+              "name": "subkey-cotizaciones",
+              "value": "[listSecrets(resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[8].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[8].id), '/')[1]), '2024-05-01').primaryKey]"
+            }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "[parameters('bocarImage')]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "APIM_GATEWAY_URL",
+                  "value": "[variables('gatewayUrl')]"
+                },
+                {
+                  "name": "APIM_API_PATH",
+                  "value": "bocar"
+                },
+                {
+                  "name": "MODEL_DEPLOYMENT",
+                  "value": "[parameters('chatDeploymentName')]"
+                },
+                {
+                  "name": "SEND_HISTORY",
+                  "value": "0"
+                },
+                {
+                  "name": "SUBKEY_PRODUCCION",
+                  "secretRef": "subkey-produccion"
+                },
+                {
+                  "name": "SUBKEY_MANTENIMIENTO",
+                  "secretRef": "subkey-mantenimiento"
+                },
+                {
+                  "name": "SUBKEY_COTIZACIONES",
+                  "secretRef": "subkey-cotizaciones"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 2
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('acaEnvName'))]",
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[7].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[7].id), '/')[1])]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[6].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[6].id), '/')[1])]",
+        "[resourceId('Microsoft.ApiManagement/service/subscriptions', split(format('{0}/{1}', variables('apimName'), variables('products')[8].id), '/')[0], split(format('{0}/{1}', variables('apimName'), variables('products')[8].id), '/')[1])]"
       ]
     },
     {
@@ -992,6 +1175,21 @@
       "dependsOn": [
         "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
         "[resourceId('Microsoft.App/containerApps', variables('almexAppName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('bocarAppName')), variables('acrPullRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('bocarAppName')), '2024-03-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[resourceId('Microsoft.App/containerApps', variables('bocarAppName'))]"
       ]
     },
     {
@@ -1066,14 +1264,22 @@
           {
             "name": "ALMEX_APP",
             "value": "[variables('almexAppName')]"
+          },
+          {
+            "name": "BOCAR_APP",
+            "value": "[variables('bocarAppName')]"
           }
         ],
-        "scriptContent": "      set -e\r\n      echo \"Construyendo imagen de Banca...\"\r\n      az acr build --registry \"$ACR\" --image banca-web:latest \"${REPO}#${BRANCH}:banca-ai-demo\"\r\n      echo \"Construyendo imagen de Salud...\"\r\n      az acr build --registry \"$ACR\" --image salud-web:latest \"${REPO}#${BRANCH}:salud-ai-demo\"\r\n      echo \"Construyendo imagen de Almex...\"\r\n      az acr build --registry \"$ACR\" --image almex-web:latest \"${REPO}#${BRANCH}:almex-ai-demo\"\r\n      echo \"Actualizando Container Apps con las imágenes reales...\"\r\n      az containerapp update -g \"$RG\" -n \"$BANCA_APP\" --image \"${ACR_SERVER}/banca-web:latest\"\r\n      az containerapp update -g \"$RG\" -n \"$SALUD_APP\" --image \"${ACR_SERVER}/salud-web:latest\"\r\n      az containerapp update -g \"$RG\" -n \"$ALMEX_APP\" --image \"${ACR_SERVER}/almex-web:latest\"\r\n      echo \"Listo.\"\r\n    "
+        "scriptContent": "      set -e\r\n      echo \"Construyendo imagen de Banca...\"\r\n      az acr build --registry \"$ACR\" --image banca-web:latest \"${REPO}#${BRANCH}:banca-ai-demo\"\r\n      echo \"Construyendo imagen de Salud...\"\r\n      az acr build --registry \"$ACR\" --image salud-web:latest \"${REPO}#${BRANCH}:salud-ai-demo\"\r\n      echo \"Construyendo imagen de Almex...\"\r\n      az acr build --registry \"$ACR\" --image almex-web:latest \"${REPO}#${BRANCH}:almex-ai-demo\"\r\n      echo \"Construyendo imagen de Bocar...\"\r\n      az acr build --registry \"$ACR\" --image bocar-web:latest \"${REPO}#${BRANCH}:bocar-ai-demo\"\r\n      echo \"Actualizando Container Apps con las imágenes reales...\"\r\n      az containerapp update -g \"$RG\" -n \"$BANCA_APP\" --image \"${ACR_SERVER}/banca-web:latest\"\r\n      az containerapp update -g \"$RG\" -n \"$SALUD_APP\" --image \"${ACR_SERVER}/salud-web:latest\"\r\n      az containerapp update -g \"$RG\" -n \"$ALMEX_APP\" --image \"${ACR_SERVER}/almex-web:latest\"\r\n      az containerapp update -g \"$RG\" -n \"$BOCAR_APP\" --image \"${ACR_SERVER}/bocar-web:latest\"\r\n      echo \"Listo.\"\r\n    "
       },
       "dependsOn": [
         "[resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))]",
+        "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('almexAppName')), variables('acrPullRoleId')))]",
+        "[resourceId('Microsoft.App/containerApps', variables('almexAppName'))]",
         "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('bancaAppName')), variables('acrPullRoleId')))]",
         "[resourceId('Microsoft.App/containerApps', variables('bancaAppName'))]",
+        "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('bocarAppName')), variables('acrPullRoleId')))]",
+        "[resourceId('Microsoft.App/containerApps', variables('bocarAppName'))]",
         "[extensionResourceId(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName')), resourceId('Microsoft.App/containerApps', variables('saludAppName')), variables('acrPullRoleId')))]",
         "[resourceId('Microsoft.App/containerApps', variables('saludAppName'))]",
         "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('uamiName'))]",
@@ -1118,6 +1324,10 @@
       "type": "string",
       "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('almexAppName')), '2024-03-01').configuration.ingress.fqdn)]"
     },
+    "bocarAppUrl": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', variables('bocarAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
     "foundryEndpoint": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.CognitiveServices/accounts', variables('aiName')), '2024-10-01').endpoint]"
@@ -1128,7 +1338,7 @@
     },
     "howToGetKeys": {
       "type": "string",
-      "value": "[format('az apim subscription show -g {0} --service-name {1} --sid <banca-retail|banca-empresas|salud-primaria|salud-especialidad|almex-clientes|almex-corporativo> --query primaryKey -o tsv', resourceGroup().name, variables('apimName'))]"
+      "value": "[format('az apim subscription show -g {0} --service-name {1} --sid <banca-retail|banca-empresas|salud-primaria|salud-especialidad|almex-clientes|almex-corporativo|bocar-produccion|bocar-mantenimiento|bocar-cotizaciones> --query primaryKey -o tsv', resourceGroup().name, variables('apimName'))]"
     }
   }
 }

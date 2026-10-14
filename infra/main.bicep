@@ -59,6 +59,9 @@ param saludImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 @description('Imagen de contenedor para la app de Logística (ALMEX).')
 param almexImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
+@description('Imagen de contenedor para la app de Manufactura (Bocar).')
+param bocarImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
+
 @description('Construir automáticamente las imágenes de las apps desde el repo público y actualizarlas (botón one-click).')
 param buildAppImages bool = true
 
@@ -83,6 +86,7 @@ var acaEnvName = '${namePrefix}-cae-${suffix}'
 var bancaAppName = 'ca-banca-web'
 var saludAppName = 'ca-salud-web'
 var almexAppName = 'ca-almex-web'
+var bocarAppName = 'ca-bocar-web'
 var uamiName = '${namePrefix}-deploy-${suffix}'
 
 var cognitiveServicesUserRoleId = 'a97b65f3-24c7-4388-baec-2e87135dc908'
@@ -372,6 +376,46 @@ resource apiAlmexPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-0
   }
 }
 
+// ---- API Bocar (Manufactura Automotriz) ------------------------------------
+resource apiBocar 'Microsoft.ApiManagement/service/apis@2024-05-01' = {
+  parent: apim
+  name: 'bocar'
+  properties: {
+    displayName: 'Bocar AI Gateway'
+    path: 'bocar'
+    protocols: [ 'https' ]
+    subscriptionRequired: true
+    serviceUrl: aoaiBaseUrl
+    subscriptionKeyParameterNames: {
+      header: 'Ocp-Apim-Subscription-Key'
+      query: 'subscription-key'
+    }
+  }
+}
+
+resource opBocar 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' = {
+  parent: apiBocar
+  name: 'chat-completions'
+  properties: {
+    displayName: 'Chat Completions'
+    method: 'POST'
+    urlTemplate: '/deployments/{deployment-id}/chat/completions'
+    templateParameters: [
+      { name: 'deployment-id', required: true, type: 'string' }
+    ]
+  }
+}
+
+resource apiBocarPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = {
+  parent: apiBocar
+  name: 'policy'
+  dependsOn: [ backendAoai, backendEmbeddings, apimCache ]
+  properties: {
+    format: 'rawxml'
+    value: loadTextContent('../bocar-ai-demo/infra/apim-policy-core.xml')
+  }
+}
+
 // ---- Productos (gobernanza por unidad de negocio) --------------------------
 // (producto, apiId, policyFile) -> se genera producto + link + política + suscripción
 var products = [
@@ -381,6 +425,9 @@ var products = [
   { id: 'salud-especialidad', display: 'Salud Especialidad', api: 'salud', policy: loadTextContent('../salud-ai-demo/infra/apim-policy-product-especialidad.xml') }
   { id: 'almex-clientes',     display: 'Almex Clientes (Autoservicio)', api: 'almex', policy: loadTextContent('../almex-ai-demo/infra/apim-policy-product-clientes.xml') }
   { id: 'almex-corporativo',  display: 'Almex Cuentas Corporativas', api: 'almex', policy: loadTextContent('../almex-ai-demo/infra/apim-policy-product-corporativo.xml') }
+  { id: 'bocar-produccion',    display: 'Bocar Producción y Calidad', api: 'bocar', policy: loadTextContent('../bocar-ai-demo/infra/apim-policy-product-produccion.xml') }
+  { id: 'bocar-mantenimiento', display: 'Bocar Mantenimiento Predictivo', api: 'bocar', policy: loadTextContent('../bocar-ai-demo/infra/apim-policy-product-mantenimiento.xml') }
+  { id: 'bocar-cotizaciones',  display: 'Bocar Ingeniería y Cotizaciones', api: 'bocar', policy: loadTextContent('../bocar-ai-demo/infra/apim-policy-product-cotizaciones.xml') }
 ]
 
 resource apimProducts 'Microsoft.ApiManagement/service/products@2024-05-01' = [for p in products: {
@@ -397,7 +444,7 @@ resource apimProducts 'Microsoft.ApiManagement/service/products@2024-05-01' = [f
 
 resource apimProductApis 'Microsoft.ApiManagement/service/products/apis@2024-05-01' = [for (p, i) in products: {
   name: '${apimName}/${p.id}/${p.api}'
-  dependsOn: [ apimProducts[i], apiBanca, apiSalud, apiAlmex ]
+  dependsOn: [ apimProducts[i], apiBanca, apiSalud, apiAlmex, apiBocar ]
 }]
 
 resource apimProductPolicies 'Microsoft.ApiManagement/service/products/policies@2024-05-01' = [for (p, i) in products: {
@@ -543,6 +590,44 @@ resource almexApp 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+resource bocarApp 'Microsoft.App/containerApps@2024-03-01' = {
+  name: bocarAppName
+  location: location
+  identity: { type: 'SystemAssigned' }
+  tags: { 'azd-service-name': 'bocar' }
+  properties: {
+    managedEnvironmentId: acaEnv.id
+    configuration: {
+      ingress: { external: true, targetPort: 8000, transport: 'auto' }
+      registries: [ { server: acr.properties.loginServer, identity: 'system' } ]
+      secrets: [
+        { name: 'subkey-produccion', value: apimSubscriptions[6].listSecrets().primaryKey }
+        { name: 'subkey-mantenimiento', value: apimSubscriptions[7].listSecrets().primaryKey }
+        { name: 'subkey-cotizaciones', value: apimSubscriptions[8].listSecrets().primaryKey }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'web'
+          image: bocarImage
+          resources: { cpu: json('0.5'), memory: '1Gi' }
+          env: [
+            { name: 'APIM_GATEWAY_URL', value: gatewayUrl }
+            { name: 'APIM_API_PATH', value: 'bocar' }
+            { name: 'MODEL_DEPLOYMENT', value: chatDeploymentName }
+            { name: 'SEND_HISTORY', value: '0' }
+            { name: 'SUBKEY_PRODUCCION', secretRef: 'subkey-produccion' }
+            { name: 'SUBKEY_MANTENIMIENTO', secretRef: 'subkey-mantenimiento' }
+            { name: 'SUBKEY_COTIZACIONES', secretRef: 'subkey-cotizaciones' }
+          ]
+        }
+      ]
+      scale: { minReplicas: 1, maxReplicas: 2 }
+    }
+  }
+}
+
 // ACR pull (keyless) para las Container Apps
 resource bancaAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(acr.id, bancaApp.id, acrPullRoleId)
@@ -574,6 +659,16 @@ resource almexAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource bocarAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, bocarApp.id, acrPullRoleId)
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: bocarApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 // ============ One-click: construir imágenes reales y actualizar apps =========
 resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = if (buildAppImages) {
   name: uamiName
@@ -597,7 +692,7 @@ resource buildScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = if (bu
     type: 'UserAssigned'
     userAssignedIdentities: { '${uami.id}': {} }
   }
-  dependsOn: [ uamiContributor, bancaApp, saludApp, bancaAcrPull, saludAcrPull ]
+  dependsOn: [ uamiContributor, bancaApp, saludApp, almexApp, bocarApp, bancaAcrPull, saludAcrPull, almexAcrPull, bocarAcrPull ]
   properties: {
     azCliVersion: '2.61.0'
     timeout: 'PT45M'
@@ -613,6 +708,7 @@ resource buildScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = if (bu
       { name: 'BANCA_APP', value: bancaAppName }
       { name: 'SALUD_APP', value: saludAppName }
       { name: 'ALMEX_APP', value: almexAppName }
+      { name: 'BOCAR_APP', value: bocarAppName }
     ]
     scriptContent: '''
       set -e
@@ -622,10 +718,13 @@ resource buildScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = if (bu
       az acr build --registry "$ACR" --image salud-web:latest "${REPO}#${BRANCH}:salud-ai-demo"
       echo "Construyendo imagen de Almex..."
       az acr build --registry "$ACR" --image almex-web:latest "${REPO}#${BRANCH}:almex-ai-demo"
+      echo "Construyendo imagen de Bocar..."
+      az acr build --registry "$ACR" --image bocar-web:latest "${REPO}#${BRANCH}:bocar-ai-demo"
       echo "Actualizando Container Apps con las imágenes reales..."
       az containerapp update -g "$RG" -n "$BANCA_APP" --image "${ACR_SERVER}/banca-web:latest"
       az containerapp update -g "$RG" -n "$SALUD_APP" --image "${ACR_SERVER}/salud-web:latest"
       az containerapp update -g "$RG" -n "$ALMEX_APP" --image "${ACR_SERVER}/almex-web:latest"
+      az containerapp update -g "$RG" -n "$BOCAR_APP" --image "${ACR_SERVER}/bocar-web:latest"
       echo "Listo."
     '''
   }
@@ -641,6 +740,7 @@ output AZURE_CONTAINER_REGISTRY_NAME string = acr.name
 output bancaAppUrl string = 'https://${bancaApp.properties.configuration.ingress.fqdn}'
 output saludAppUrl string = 'https://${saludApp.properties.configuration.ingress.fqdn}'
 output almexAppUrl string = 'https://${almexApp.properties.configuration.ingress.fqdn}'
+output bocarAppUrl string = 'https://${bocarApp.properties.configuration.ingress.fqdn}'
 output foundryEndpoint string = aiServices.properties.endpoint
 output resourceGroupName string = resourceGroup().name
-output howToGetKeys string = 'az apim subscription show -g ${resourceGroup().name} --service-name ${apimName} --sid <banca-retail|banca-empresas|salud-primaria|salud-especialidad|almex-clientes|almex-corporativo> --query primaryKey -o tsv'
+output howToGetKeys string = 'az apim subscription show -g ${resourceGroup().name} --service-name ${apimName} --sid <banca-retail|banca-empresas|salud-primaria|salud-especialidad|almex-clientes|almex-corporativo|bocar-produccion|bocar-mantenimiento|bocar-cotizaciones> --query primaryKey -o tsv'

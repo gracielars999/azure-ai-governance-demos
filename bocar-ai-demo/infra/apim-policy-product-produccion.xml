@@ -1,0 +1,18 @@
+<policies>
+    <inbound>
+        <base />
+        <azure-openai-token-limit
+            tokens-per-minute="30000"
+            counter-key="@(context.Subscription.Id)"
+            estimate-prompt-tokens="true"
+            tokens-consumed-header-name="x-tokens-consumed"
+            remaining-tokens-header-name="x-tokens-remaining"
+            retry-after-header-name="Retry-After" />
+        <set-header name="x-unidad-negocio" exists-action="override">
+            <value>Bocar-Produccion-Calidad</value>
+        </set-header>
+    </inbound>
+    <backend><base /></backend>
+    <outbound><base /></outbound>
+    <on-error><base /></on-error>
+</policies>
